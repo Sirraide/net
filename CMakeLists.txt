@@ -14,6 +14,7 @@ file(GLOB CLI src/client.cc)
 file(GLOB SRV src/server.cc)
 
 add_subdirectory(libs/fmt)
+add_subdirectory(libs/curl)
 add_executable(client ${CLI})
 add_executable(server ${SRV})
 
@@ -34,7 +35,7 @@ else ()
 	target_link_options(options INTERFACE -rdynamic)
 endif ()
 
-target_include_directories(options INTERFACE include)
+target_include_directories(options INTERFACE include libs/fmt/include libs/json/include libs/curl/include)
 
-target_link_libraries(client PRIVATE options fmt)
-target_link_libraries(server PRIVATE options fmt)
+target_link_libraries(client PRIVATE options fmt libcurl)
+target_link_libraries(server PRIVATE options fmt libcurl)

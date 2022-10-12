@@ -287,6 +287,23 @@ static inline require_operator_lhs require_operator_lhs_instance;
 
 #define require require_operator_lhs_instance %
 
+/// Encode a URL.
+inline std::string encode_uri(std::string_view raw) {
+    size_t start = 0;
+    if (auto pos = raw.find("://")) start = pos + 3;
+
+    std::string encoded;
+    encoded.reserve(raw.size() * 3);
+    for (size_t i = start; i < raw.size(); i++) {
+        if (std::isalnum(raw[i]) || raw[i] == '-' || raw[i] == '_' || raw[i] == '.' || raw[i] == '~') encoded += raw[i];
+        else {
+            encoded += '%';
+            encoded += fmt::format("{:02X}", u8(raw[i]));
+        }
+    }
+    return encoded;
+}
+
 /// Enum arithmetic.
 #define ENUM_OPERATOR(op)                                                                                    \
     template <typename enumeration, typename integer>                                                        \

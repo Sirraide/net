@@ -1,13 +1,11 @@
 #include <net/tcp.hh>
+#include <net/http.hh>
 
 namespace tcp = net::tcp;
+namespace http = net::http;
 
 int main() try {
-    tcp::client client;
-    client.connect("localhost", 8080);
-    client.send("Hello, world!");
-    fmt::print("Received: {}\n", client.recv());
-    client.close();
+    fmt::print("{}", http::get("https://www.nguh.org").body);
 } catch (const std::exception& e) {
-    err("Exception caught: {}", e.what());
+    err("{}", e.what());
 }

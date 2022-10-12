@@ -4,3 +4,6 @@
 [submodule "libs/fmt"]
 	path = libs/fmt
 	url = https://github.com/fmtlib/fmt
+[submodule "libs/curl"]
+	path = libs/curl
+	url = https://github.com/curl/curl
