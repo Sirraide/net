@@ -158,6 +158,7 @@ struct server : detail::tcp_base {
 /// ===========================================================================
 struct client : detail::tcp_base {
     client() = default;
+    client(std::string_view host, u16 port) { connect(host, port); }
     ~client() { close(); }
     nocopy(client);
     nomove(client);

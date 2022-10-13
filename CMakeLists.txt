@@ -13,6 +13,8 @@ add_compile_options(-fdiagnostics-color=always -fPIC)
 file(GLOB CLI src/client.cc)
 file(GLOB SRV src/server.cc)
 
+set(ENABLE_WEBSOCKETS ON)
+
 add_subdirectory(libs/fmt)
 add_subdirectory(libs/curl)
 add_executable(client ${CLI})

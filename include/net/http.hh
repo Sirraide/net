@@ -54,7 +54,7 @@ template <typename body_t>
 struct response {
     using body_type = body_t;
 
-    long status;
+    long status{};
     body_type body;
     headers hdrs;
 };
@@ -164,6 +164,20 @@ public:
 
         /// Return the response.
         return res;
+    }
+
+    /// Set a cURL option.
+    template <typename... arguments>
+    void setopt(CURLoption option, arguments&&... args) {
+        std::unique_lock lock{mtx};
+        curl_easy_setopt(handle, option, std::forward<arguments>(args)...);
+    }
+
+    /// Perform a request.
+    void operator()() {
+        std::unique_lock lock{mtx};
+        auto code = curl_easy_perform(handle);
+        if (code != CURLE_OK) throw std::runtime_error(curl_easy_strerror(code));
     }
 };
 } // namespace detail
