@@ -77,7 +77,6 @@ inline bool curl_initialisation_done = false;
 /// cURL handle.
 class curl {
     CURL* handle = nullptr;
-    std::mutex mtx;
 
 public:
     /// Initialise cURL.
@@ -112,8 +111,6 @@ public:
     /// Perform a request.
     template <method m, typename body_type>
     response<body_type> perform(request&& req) {
-        std::unique_lock lock{mtx};
-
         /// Set the URL.
         curl_easy_setopt(handle, CURLOPT_URL, req.uri.data());
 
@@ -169,13 +166,11 @@ public:
     /// Set a cURL option.
     template <typename... arguments>
     void setopt(CURLoption option, arguments&&... args) {
-        std::unique_lock lock{mtx};
         curl_easy_setopt(handle, option, std::forward<arguments>(args)...);
     }
 
     /// Perform a request.
     void operator()() {
-        std::unique_lock lock{mtx};
         auto code = curl_easy_perform(handle);
         if (code != CURLE_OK) throw std::runtime_error(curl_easy_strerror(code));
     }
