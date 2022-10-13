@@ -96,11 +96,11 @@ public:
         handle = curl_easy_init();
 
         /// Follow redirects.
-        curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(handle, CURLOPT_MAXREDIRS, 10L);
+        setopt(CURLOPT_FOLLOWLOCATION, 1L);
+        setopt(CURLOPT_MAXREDIRS, 10L);
 
         /// Make sure this is thread-safe.
-        curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1L);
+        setopt(CURLOPT_NOSIGNAL, 1L);
     }
 
     /// Destroy the cURL handle.
@@ -112,17 +112,17 @@ public:
     template <method m, typename body_type>
     response<body_type> perform(request&& req) {
         /// Set the URL.
-        curl_easy_setopt(handle, CURLOPT_URL, req.uri.data());
+        setopt(CURLOPT_URL, req.uri.data());
 
         /// Set the HTTP method.
-        if constexpr (m == method::get) curl_easy_setopt(handle, CURLOPT_HTTPGET, 1L);
+        if constexpr (m == method::get) setopt(CURLOPT_HTTPGET, 1L);
 
         /// Set the request headers.
         struct curl_slist* headers = nullptr;
         for (auto& [key, value] : req.hdrs.values) {
             headers = curl_slist_append(headers, fmt::format("{}: {}", key, value).c_str());
         }
-        curl_easy_setopt(handle, CURLOPT_HTTPHEADER, headers);
+        setopt(CURLOPT_HTTPHEADER, headers);
 
         /// The response.
         response<body_type> res;
@@ -133,8 +133,8 @@ public:
             body.insert(body.end(), ptr, ptr + size * nmemb);
             return size * nmemb;
         };
-        curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, write_cb);
-        curl_easy_setopt(handle, CURLOPT_WRITEDATA, &res.body);
+        setopt(CURLOPT_WRITEFUNCTION, write_cb);
+        setopt(CURLOPT_WRITEDATA, std::addressof(res.body));
 
         /// Set the callback to write the response headers.
         curl_write_callback header_cb = [](char* ptr, size_t size, size_t nmemb, void* userdata) {
@@ -146,15 +146,15 @@ public:
             }
             return size * nmemb;
         };
-        curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, header_cb);
-        curl_easy_setopt(handle, CURLOPT_HEADERDATA, &res.hdrs);
+        setopt(CURLOPT_HEADERFUNCTION, header_cb);
+        setopt(CURLOPT_HEADERDATA, std::addressof(res.hdrs));
 
         /// Perform the request.
         auto code = curl_easy_perform(handle);
         if (code != CURLE_OK) throw std::runtime_error(curl_easy_strerror(code));
 
         /// Get the response status.
-        curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &res.status);
+        curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, std::addressof(res.status));
 
         /// Free the headers.
         curl_slist_free_all(headers);
