@@ -10,6 +10,17 @@ add_compile_options(-fdiagnostics-color=always -fPIC)
 ## Targets
 ##
 
+## OpenSSL
+add_custom_target (
+	openssl
+	WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+	COMMAND ${CMAKE_COMMAND} -P "${PROJECT_SOURCE_DIR}/build-ssl.cmake"
+	BYPRODUCTS ${PROJECT_SOURCE_DIR}/libs/libcrypto.so ${PROJECT_SOURCE_DIR}/libs/libssl.so
+	USES_TERMINAL
+)
+
+## Other Targets
+
 file(GLOB CLI src/client.cc)
 file(GLOB SRV src/server.cc)
 
@@ -38,6 +49,14 @@ else ()
 endif ()
 
 target_include_directories(options INTERFACE include libs/fmt/include libs/json/include libs/curl/include)
+
+add_dependencies(options openssl)
+target_link_libraries(options INTERFACE
+	fmt
+	libcurl
+	${PROJECT_SOURCE_DIR}/libs/libcrypto.so
+	${PROJECT_SOURCE_DIR}/libs/libssl.so
+)
 
 target_link_libraries(client PRIVATE options fmt libcurl)
 target_link_libraries(server PRIVATE options fmt libcurl)
