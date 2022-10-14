@@ -4,7 +4,7 @@
 #include "http.hh"
 #include "tcp.hh"
 
-#include <condition_variable>
+#include <openssl/ssl.h>
 
 namespace net::websock {
 struct client {
@@ -13,7 +13,8 @@ struct client {
         connecting
     } state = st::connecting;
 
-    http::detail::curl curl;
+    tcp::client tcp;
+    SSL_CTX *ctx = nullptr;
 
     /// Connect to a websocket server.
     ///
@@ -21,25 +22,22 @@ struct client {
     /// \throws std::runtime_error If the connection fails.
     explicit client(std::string_view url) {
         /// TODO: Parse and validate URL.
-        bool secure = url.starts_with("wss://");
+        const bool secure = url.starts_with("wss://");
+
+        /// TODO: There MUST be no more than one connection in a CONNECTING state.
 
         /// Connect to the server.
-        auto port = secure ? 443 : 80;
+        const auto port = secure ? 443 : 80;
+        tcp.connect(url.substr(secure ? 6 : 5), port);
 
-        /// Setup the TLS handshake if necessary.
+        /// Perform a TLS handshake using openssl if needed.
         if (secure) {
-            curl.setopt(CURLOPT_VERBOSE, 1L);
-            curl.setopt(CURLOPT_SSL_VERIFYPEER, 1L);
-            curl.setopt(CURLOPT_SSL_VERIFYHOST, 1L);
-            curl.setopt(CURLOPT_TCP_KEEPALIVE, 1L);
-            curl.setopt(CURLOPT_TCP_KEEPIDLE, 60L);
+            /// Perform a TLS handshake using openssl
+
+
         }
 
-        /// Connect to the server.
-        curl.setopt(CURLOPT_URL, url.data());
-        curl.setopt(CURLOPT_CONNECT_ONLY, 2L); /// WebSocket
-        curl.setopt(CURLOPT_PORT, (long) port);
-        curl();
+
     }
 
     ~client() = default;
