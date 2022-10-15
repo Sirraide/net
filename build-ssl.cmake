@@ -26,7 +26,7 @@ function(build)
         OUTPUT_STRIP_TRAILING_WHITESPACE
     )
     execute_process (
-        COMMAND ./config "--prefix=${CMAKE_SOURCE_DIR}/out/openssl" "--openssldir=${CMAKE_SOURCE_DIR}/out/openssl"
+        COMMAND ./config "CFLAGS=-O3 -march=native" "--prefix=${CMAKE_SOURCE_DIR}/out/openssl" "--openssldir=${CMAKE_SOURCE_DIR}/out/openssl"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/libs/openssl"
         ECHO_ERROR_VARIABLE
         ECHO_OUTPUT_VARIABLE

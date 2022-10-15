@@ -4,7 +4,7 @@ project(net VERSION 1.0.0)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})
 
-add_compile_options(-fdiagnostics-color=always -fPIC -march=native)
+add_compile_options(-fdiagnostics-color=always -fPIC)
 add_definitions(-DNET_SSL_CERT="${PROJECT_SOURCE_DIR}/libs/openssl/apps/cert.pem")
 
 ##
