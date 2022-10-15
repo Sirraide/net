@@ -3,7 +3,7 @@
 namespace tcp = net::tcp;
 
 int main() {
-    tcp::server server;
+    /*tcp::server server;
     server.listen(8080);
 
     for (;;) try {
@@ -14,5 +14,5 @@ int main() {
         conn.close();
     } catch (const std::exception& e) {
         err("Exception caught: {}", e.what());
-    }
+    }*/
 }

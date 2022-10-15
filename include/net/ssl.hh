@@ -30,17 +30,19 @@ class client {
     bool stop_receiving = false;
     bool thread_running = false;
     std::thread recv_thread;
+    std::recursive_mutex swap_lock;
 
     /// Get the current error message.
-    [[nodiscard]] std::string geterr() const {
+    [[nodiscard]] std::string geterr() {
         char buf[256];
+        std::unique_lock lock{swap_lock};
         ERR_error_string_n(ERR_get_error(), buf, sizeof buf);
         return buf;
     }
 
     /// Raise an error.
     template <typename... arguments>
-    [[noreturn]] void raise(fmt::format_string<arguments...> format, arguments&&... args) const {
+    [[noreturn]] void raise(fmt::format_string<arguments...> format, arguments&&... args) {
         std::string message = fmt::format(format, std::forward<arguments>(args)...);
         message += fmt::format(": {}", geterr());
         throw std::runtime_error(message);
@@ -49,6 +51,20 @@ class client {
 public:
     client() = default;
     ~client() { close(); }
+    nocopy(client);
+    client(client&& other) noexcept : ctx(nullptr), bio(nullptr), ssl(nullptr) { *this = std::move(other); }
+    client& operator=(client&& other) noexcept {
+        if (this == std::addressof(other)) { return *this; }
+        std::scoped_lock lock{swap_lock, other.swap_lock};
+
+        std::swap(ctx, other.ctx);
+        std::swap(bio, other.bio);
+        std::swap(ssl, other.ssl);
+        std::swap(connected, other.connected);
+        std::swap(stop_receiving, other.stop_receiving);
+        std::swap(thread_running, other.thread_running);
+        std::swap(recv_thread, other.recv_thread);
+    }
 
     /// Connect to a server.
     ///
@@ -61,6 +77,7 @@ public:
 
         /// Wait for the receive thread to stop if we're reusing this client.
         while (stop_receiving and thread_running) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::unique_lock lock{swap_lock};
 
         /// Let openssl figure out the TLS version.
         const SSL_METHOD* method = TLS_client_method();
@@ -144,6 +161,7 @@ public:
 
     /// Close the connection.
     void close() {
+        std::unique_lock lock{swap_lock};
         if (bio) {
             BIO_free_all(bio);
             bio = nullptr;
@@ -167,11 +185,12 @@ public:
     /// \param data The data to send.
     /// \param size The size of the data to send (in bytes).
     /// \throws std::runtime_error If the send fails.
-    void send(const char* data, size_t size) const {
+    void send(const char* data, size_t size) {
         if (not connected) raise("SSL client not connected");
         if (size > std::numeric_limits<int>::max()) raise("SSL client send size too large");
 
         /// Send the data.
+        std::unique_lock lock{swap_lock};
         auto res = BIO_write(bio, data, int(size));
         if (res != int(size)) raise("OpenSSL: BIO_write() failed");
     }
@@ -181,7 +200,7 @@ public:
     /// \param data The data to send.
     /// \throws std::runtime_error If the send fails.
     template <typename data_t>
-    void send(data_t&& data) const { send(data.data(), data.size()); }
+    void send(data_t&& data) { send(data.data(), data.size()); }
 
     /// Receive data from the server.
     ///
@@ -190,16 +209,18 @@ public:
     /// \param us_timeout How long to wait between each attempted receive (in microseconds).
     /// \returns The number of bytes received.
     /// \throws std::runtime_error If the receive fails.
-    size_t recv(char* data, size_t size, size_t us_interval = 50) const {
+    size_t recv(char* data, size_t size, size_t us_interval = 50) {
         if (not connected) raise("SSL client not connected");
         if (thread_running and std::this_thread::get_id() != recv_thread.get_id()) raise("Cannot recv() while receive thread is running");
         if (not size or size > std::numeric_limits<int>::max()) raise("SSL client recv must be between 1 and {}", std::numeric_limits<int>::max());
 
         /// Receive data.
         for (;;) {
+            std::unique_lock lock{swap_lock};
             auto n_read = BIO_read(bio, data, int(size));
             if (n_read < 0) {
                 if (not BIO_should_retry(bio)) raise("OpenSSL: BIO_read() failed");
+                lock.unlock();
                 std::this_thread::sleep_for(std::chrono::microseconds(us_interval));
                 continue;
             }
@@ -259,7 +280,9 @@ public:
 
                     /// Call the callback if we have enough data.
                     if (n_read < min_size) continue;
+                    std::unique_lock lock{swap_lock};
                     auto processed = callback(recv_buffer);
+                    lock.unlock();
                     recv_buffer.erase(recv_buffer.begin(), recv_buffer.begin() + processed);
                 }
             } catch (const std::exception& e) { error_callback(e); }

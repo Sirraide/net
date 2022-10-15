@@ -1,10 +1,10 @@
 #ifndef NET_HTTP_HH
 #define NET_HTTP_HH
 
+#include "ssl.hh"
 #include "utils.hh"
 
 #include <atomic>
-#include <curl/curl.h>
 #include <mutex>
 #include <unordered_map>
 
@@ -54,133 +54,76 @@ template <typename body_t>
 struct response {
     using body_type = body_t;
 
-    long status{};
+    u32 status{};
     body_type body;
     headers hdrs;
+
+    response& expect(u32 code) {
+        if (status != code) throw std::runtime_error(fmt::format("Expected status {}, but was {}", status, code));
+        return *this;
+    }
+};
+
+struct url {
+    std::string data;
+
+    url(std::convertible_to<std::string_view> auto&& data) : data(encode_uri(std::forward<decltype(data)>(data))) {}
 };
 
 /// HTTP request.
+template <typename body_t = std::string>
 struct request {
-    std::string uri;
+    using body_type = body_t;
+
+    url path;
     headers hdrs;
-    std::vector<char> body;
+    body_type body;
 
     /// Create a request.
-    explicit request(std::string_view uri, bool encode_url = true)
-        : uri(encode_url ? encode_uri(uri) : std::string(uri)) {}
+    explicit request(struct url path, headers hdrs = {})
+        : path(std::move(path)),
+          hdrs(std::move(hdrs)) {}
 };
 
 namespace detail {
-inline std::atomic_flag curl_initialised = ATOMIC_FLAG_INIT;
-inline bool curl_initialisation_done = false;
 
-/// cURL handle.
-class curl {
-    CURL* handle = nullptr;
-
-public:
-    /// Initialise cURL.
-    curl() {
-        /// Initialise cURL once.
-        if (not curl_initialised.test_and_set()) {
-            curl_global_init(CURL_GLOBAL_ALL);
-            curl_initialisation_done = true;
-        }
-
-        /// Spin until cURL is initialised. Spinlocks should usually be avoided,
-        /// but in this case it's fine because we're only spinning for a very
-        /// short time.
-        while (not curl_initialisation_done) continue;
-
-        /// Create a new cURL handle.
-        handle = curl_easy_init();
-
-        /// Follow redirects.
-        setopt(CURLOPT_FOLLOWLOCATION, 1L);
-        setopt(CURLOPT_MAXREDIRS, 10L);
-
-        /// Make sure this is thread-safe.
-        setopt(CURLOPT_NOSIGNAL, 1L);
-    }
-
-    /// Destroy the cURL handle.
-    ~curl() {
-        if (handle) curl_easy_cleanup(handle);
-    }
-
-    /// Perform a request.
-    template <method m, typename body_type>
-    response<body_type> perform(request&& req) {
-        /// Set the URL.
-        setopt(CURLOPT_URL, req.uri.data());
-
-        /// Set the HTTP method.
-        if constexpr (m == method::get) setopt(CURLOPT_HTTPGET, 1L);
-
-        /// Set the request headers.
-        struct curl_slist* headers = nullptr;
-        for (auto& [key, value] : req.hdrs.values) {
-            headers = curl_slist_append(headers, fmt::format("{}: {}", key, value).c_str());
-        }
-        setopt(CURLOPT_HTTPHEADER, headers);
-
-        /// The response.
-        response<body_type> res;
-
-        /// Set the callback to write the response body.
-        curl_write_callback write_cb = [](char* ptr, size_t size, size_t nmemb, void* userdata) {
-            auto& body = *static_cast<body_type*>(userdata);
-            body.insert(body.end(), ptr, ptr + size * nmemb);
-            return size * nmemb;
-        };
-        setopt(CURLOPT_WRITEFUNCTION, write_cb);
-        setopt(CURLOPT_WRITEDATA, std::addressof(res.body));
-
-        /// Set the callback to write the response headers.
-        curl_write_callback header_cb = [](char* ptr, size_t size, size_t nmemb, void* userdata) {
-            auto& headers = *static_cast<struct headers*>(userdata);
-            std::string_view header{ptr, size * nmemb};
-            auto colon = header.find(':');
-            if (colon != std::string_view::npos) {
-                headers.values[std::string{header.substr(0, colon)}] = std::string{header.substr(colon + 2)};
-            }
-            return size * nmemb;
-        };
-        setopt(CURLOPT_HEADERFUNCTION, header_cb);
-        setopt(CURLOPT_HEADERDATA, std::addressof(res.hdrs));
-
-        /// Perform the request.
-        auto code = curl_easy_perform(handle);
-        if (code != CURLE_OK) throw std::runtime_error(curl_easy_strerror(code));
-
-        /// Get the response status.
-        curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, std::addressof(res.status));
-
-        /// Free the headers.
-        curl_slist_free_all(headers);
-
-        /// Return the response.
-        return res;
-    }
-
-    /// Set a cURL option.
-    template <typename... arguments>
-    void setopt(CURLoption option, arguments&&... args) {
-        curl_easy_setopt(handle, option, std::forward<arguments>(args)...);
-    }
-
-    /// Perform a request.
-    void operator()() {
-        auto code = curl_easy_perform(handle);
-        if (code != CURLE_OK) throw std::runtime_error(curl_easy_strerror(code));
-    }
-};
 } // namespace detail
 
+template <typename backend_t = tcp::client>
+class client {
+    using backend_type = backend_t;
+    backend_type conn;
+
+public:
+    explicit client(backend_type&& conn) : conn(std::move(conn)) {}
+
+    /// Perform a request.
+    ///
+    /// \param req The request to perform.
+    /// \throw std::runtime_error If the request fails.
+    /// \return The response.
+    template <typename body_t = std::string>
+    response<body_t> perform(const request<body_t>& req) {
+        UNREACHABLE();
+    }
+
+    /// Perform a GET request.
+    ///
+    /// \param uri The URI to GET.
+    /// \param hdrs The headers to send.
+    /// \return The response.
+    template <typename body_t = std::string>
+    response<body_t> get(url url, headers hdrs = {}) {
+        UNREACHABLE();
+    }
+};
+
 /// Perform a GET request.
-template <typename body = std::string>
-inline response<body> get(std::string_view url) {
-    return detail::curl().perform<method::get, body>(request{url});
+template <typename body_t = std::string>
+inline response<body_t> get(std::string_view url) {
+    return url.starts_with("https")
+        ? client(net::ssl::client()).template get<body_t>(url)
+        : client(net::tcp::client()).template get<body_t>(url);
 }
 
 } // namespace net::http
