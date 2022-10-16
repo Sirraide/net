@@ -16,14 +16,17 @@ namespace detail {
 class tcp_base {
     bool thread_running = false;
     bool stop_receiving = false;
-    bool connected = false;
     std::thread recv_thread;
-    std::recursive_mutex swap_lock;
+    std::exception_ptr recv_exception = nullptr;
+    std::vector<char> recv_buffer;
+    std::mutex mtx;
+    std::condition_variable cv;
 
 protected:
     using error = std::runtime_error;
 
     int fd = -1;
+    bool connected = false;
 
     /// Get the current error message.
     [[nodiscard]] std::string geterr() const { return std::strerror(errno); }
@@ -42,17 +45,60 @@ public:
     tcp_base(int fd) : fd(fd) {}
     ~tcp_base() { close(); }
     nocopy(tcp_base);
-    tcp_base(tcp_base&& other) noexcept : fd(-1) { *this = std::move(other); }
-    tcp_base& operator=(tcp_base&& other) noexcept {
+    tcp_base(tcp_base&& other) : fd(-1) { *this = std::move(other); }
+    tcp_base& operator=(tcp_base&& other) {
         if (this == std::addressof(other)) { return *this; }
-        std::scoped_lock lock{swap_lock, other.swap_lock};
 
-        std::swap(fd, other.fd);
-        std::swap(thread_running, other.thread_running);
-        std::swap(stop_receiving, other.stop_receiving);
-        std::swap(connected, other.connected);
-        std::swap(recv_thread, other.recv_thread);
+        /// Shut us down.
+        std::unique_lock lock{mtx};
+        if (thread_running) {
+            stop_receiving = true;
+            cv.wait(lock, [this] { return not thread_running; });
+            recv_thread.join();
+        }
+        close();
+
+        /// Take over the other connexion.
+        std::unique_lock other_lock{other.mtx};
+
+        /// We need to stop and restart the other thread if it's running.
+        bool restart = other.thread_running;
+        if (restart) {
+            other.stop_receiving = true;
+            other.cv.wait(other_lock, [&other] { return not other.thread_running; });
+            other.recv_thread.join();
+        }
+
+        /// Move the connexion state.
+        fd = other.fd;
+        connected = other.connected;
+        thread_running = false;
+        stop_receiving = false;
+        recv_exception = std::move(other.recv_exception);
+        recv_buffer = std::move(other.recv_buffer);
+        other.fd = -1;
+        other.connected = false;
+        other.stop_receiving = false;
+        other.recv_exception = nullptr;
+        other.recv_buffer = {};
+
+        /// Restart the thread if needed.
+        if (restart) { recv_async(); }
         return *this;
+    }
+
+    /// Get the data stored in the receive buffer.
+    /// \throw std::runtime_error if the receive thread errored.
+    [[nodiscard]] std::vector<char> buffer() {
+        std::unique_lock lock{mtx};
+        if (recv_exception) {
+            auto except = std::move(recv_exception);
+            recv_exception = nullptr;
+            std::rethrow_exception(except);
+        }
+        auto ret = std::move(recv_buffer);
+        recv_buffer = {};
+        return ret;
     }
 
     /// Close the socket.
@@ -62,32 +108,23 @@ public:
             ::close(fd);
             fd = -1;
         }
+
+        if (recv_thread.joinable()) {
+            recv_thread.join();
+        }
     }
 
-    /// Receive data in a separate thread and call a callback whenever data is received.
+    /// Receive data in a separate thread.
     ///
     /// This creates a dedicated thread which repeatedly calls recv(), storing the received
-    /// data in a buffer and calling a user-supplied callback when enough data has accumulated.
-    /// The thread is joined when it errors, the client is destroyed, or when close()
+    /// data in a buffer. The thread is joined when it errors, the client is destroyed, or close()
     /// or stop_receiving() is called.
     ///
-    /// \param min_size The minimum number of bytes to receive before calling the callback.
-    ///     If the receive buffer contains fewer bytes than this, the callback will not be called.
-    ///     If the size is 0, the callback will always be called.
-    /// \param callback The callback to call when data is received. It should return the number
-    ///     of bytes to remove from the receive buffer.
-    /// \param error_callback The callback to call if an error occurs.
-    /// \throws std::runtime_error If the receive thread cannot be created.
-    template <typename recv_data_type>
-    void recv_async(
-        size_t min_size,
-        std::function<size_t(const recv_data_type&)> callback,
-        std::function<void(const std::exception&)> error_callback
-    ) {
+    /// \throws std::runtime_error If the thread cannot be created.
+    void recv_async() {
         if (not connected) throw error("Cannot receive data on a disconnected socket");
-        if (thread_running) throw error("SSL client already receiving");
-        if (stop_receiving) throw error("SSL client shutting down");
-        if (min_size > std::numeric_limits<int>::max()) throw error("SSL client recv size too large");
+        if (thread_running) throw error("Client already receiving");
+        if (stop_receiving) throw error("Client shutting down");
 
         /// Set a receive timeout.
         timeval timeout{};
@@ -97,32 +134,42 @@ public:
         if (res == -1) raise("setsockopt() failed");
 
         /// Start receiving asynchronously.
-        recv_thread = std::thread([this, callback = std::move(callback), error_callback = std::move(error_callback), min_size] {
-            /// Clear the buffer.
-            thread_running = true;
-            recv_data_type recv_buffer;
+        recv_thread = std::thread([this] {
+            /// Signal that the thread has exited.
+            defer {
+                thread_running = false;
+                stop_receiving = false;
+                cv.notify_all();
+            };
 
-            /// If min_size is small, we can avoid reallocations by using a larger buffer.
-            size_t reserve = std::max(min_size, size_t(1024));
+            try {
+                /// Grow the receive buffer as needed.
+                static constexpr size_t grow_by = 1024;
 
-            /// Receive data.
-            while (not stop_receiving) {
-                /// Make sure we don't try to move this while we're receiving.
-
-                /// Reserve more space in the buffer.
-                auto sz = recv_buffer.size();
-                recv_buffer.resize(sz + reserve);
+                /// Clear the buffer.
+                {
+                    std::unique_lock lock{mtx};
+                    thread_running = true;
+                    recv_buffer.clear();
+                }
 
                 /// Receive data.
-                auto n_read = recv(recv_buffer.data() + sz, reserve, 100'000);
-                recv_buffer.resize(sz + n_read);
+                while (not stop_receiving) {
+                    /// Make sure we don't try to move this while we're receiving.
+                    std::unique_lock lock{mtx};
+                    if (stop_receiving) break;
 
-                /// Call the callback if we have enough data.
-                if (n_read < min_size) continue;
-                std::unique_lock lock{swap_lock};
-                auto processed = callback(recv_buffer);
-                lock.unlock();
-                recv_buffer.erase(recv_buffer.begin(), recv_buffer.begin() + processed);
+                    /// Reserve more space in the buffer.
+                    auto sz = recv_buffer.size();
+                    if (recv_buffer.capacity() < sz + grow_by) recv_buffer.resize(sz + grow_by);
+
+                    /// Receive data.
+                    auto n_read = recv<false>(recv_buffer.data() + sz, recv_buffer.size() - sz, 100'000);
+                    recv_buffer.resize(sz + n_read);
+                }
+            } catch (const std::exception& e) {
+                std::unique_lock lock{mtx};
+                recv_exception = std::make_exception_ptr(e);
             }
         });
     }
@@ -131,9 +178,10 @@ public:
     ///
     /// \param msg The message to send.
     /// \throw std::runtime_error if the call to ::send() fails.
-    void send(std::string_view msg) {
+    template <typename message>
+    void send(message&& msg) {
         if (not connected) throw error("Cannot send data on a disconnected socket");
-        std::unique_lock lock{swap_lock};
+        std::unique_lock lock{mtx};
         auto n = ::send(fd, msg.data(), msg.size(), 0);
         if (n == -1) raise("send() failed");
     }
@@ -145,17 +193,22 @@ public:
     /// \param us_timeout How long to wait between each attempted receive (in microseconds).
     /// \returns The number of bytes received.
     /// \throws std::runtime_error If the receive fails.
+    template <bool lck = true>
     size_t recv(char* data, size_t size, size_t us_interval = 50) {
         if (thread_running and std::this_thread::get_id() != recv_thread.get_id()) throw error("Cannot recv() while receive thread is running");
         if (not size) return 0;
 
         /// Receive data.
         for (;;) {
-            std::unique_lock lock{swap_lock};
-            auto n_read = ::recv(fd, data, size, 0);
-            lock.unlock();
+            ssize_t n_read;
+            if constexpr (lck) {
+                std::unique_lock lock{mtx};
+                n_read = ::recv(fd, data, size, 0);
+                lock.unlock();
+            } else {
+                n_read = ::recv(fd, data, size, 0);
+            }
             if (n_read <= 0) {
-
                 if (errno == EINTR or errno == EAGAIN or errno == EWOULDBLOCK)
                     std::this_thread::sleep_for(std::chrono::microseconds(us_interval));
                 else raise("recv() failed");
@@ -220,13 +273,19 @@ struct server : detail::tcp_base {
 /// ===========================================================================
 ///  TCP Client
 /// ===========================================================================
-struct client : detail::tcp_base {
+class client : public detail::tcp_base {
+    std::string host_name;
+
+public:
     client() = default;
     client(std::string_view host, u16 port) { connect(host, port); }
     ~client() { close(); }
     nocopy(client);
     client(client&& other) noexcept = default;
     client& operator=(client&& other) noexcept = default;
+
+    /// Returns the current host name or the empty string if not connected.
+    [[nodiscard]] std::string_view host() const { return host_name; }
 
     /// Connect to a server.
     ///
@@ -261,6 +320,10 @@ struct client : detail::tcp_base {
             fd = -1;
             throw std::runtime_error("connect() failed");
         }
+
+        /// We're connected!
+        host_name = host;
+        connected = true;
     }
 };
 

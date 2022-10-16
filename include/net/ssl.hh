@@ -30,12 +30,15 @@ class client {
     bool stop_receiving = false;
     bool thread_running = false;
     std::thread recv_thread;
-    std::recursive_mutex swap_lock;
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::exception_ptr recv_exception = nullptr;
+    std::vector<char> recv_buffer;
+    std::string host_name;
 
     /// Get the current error message.
     [[nodiscard]] std::string geterr() {
         char buf[256];
-        std::unique_lock lock{swap_lock};
         ERR_error_string_n(ERR_get_error(), buf, sizeof buf);
         return buf;
     }
@@ -50,20 +53,70 @@ class client {
 
 public:
     client() = default;
+    client(std::string_view host, u16 port) { connect(host, port); }
     ~client() { close(); }
     nocopy(client);
     client(client&& other) noexcept : ctx(nullptr), bio(nullptr), ssl(nullptr) { *this = std::move(other); }
     client& operator=(client&& other) noexcept {
         if (this == std::addressof(other)) { return *this; }
-        std::scoped_lock lock{swap_lock, other.swap_lock};
 
-        std::swap(ctx, other.ctx);
-        std::swap(bio, other.bio);
-        std::swap(ssl, other.ssl);
-        std::swap(connected, other.connected);
-        std::swap(stop_receiving, other.stop_receiving);
-        std::swap(thread_running, other.thread_running);
-        std::swap(recv_thread, other.recv_thread);
+        /// Shut us down.
+        std::unique_lock lock{mtx};
+        if (thread_running) {
+            stop_receiving = true;
+            cv.wait(lock, [this] { return not thread_running; });
+            recv_thread.join();
+        }
+        close();
+
+        /// Take over the other connexion.
+        std::unique_lock other_lock{other.mtx};
+
+        /// We need to stop and restart the other thread if it's running.
+        bool restart = other.thread_running;
+        if (restart) {
+            other.stop_receiving = true;
+            other.cv.wait(other_lock, [&other] { return not other.thread_running; });
+            other.recv_thread.join();
+        }
+
+        /// Move the connexion state.
+        ctx = other.ctx;
+        bio = other.bio;
+        ssl = other.ssl;
+        connected = other.connected;
+        stop_receiving = false;
+        thread_running = false;
+        recv_exception = std::move(other.recv_exception);
+        recv_buffer = std::move(other.recv_buffer);
+        other.ctx = nullptr;
+        other.bio = nullptr;
+        other.ssl = nullptr;
+        other.connected = false;
+        other.stop_receiving = false;
+        other.recv_exception = nullptr;
+        other.recv_buffer = {};
+
+        /// Restart the thread if needed.
+        if (restart) { recv_async(); }
+        return *this;
+    }
+
+    /// Returns the current host name or the empty string if not connected.
+    [[nodiscard]] std::string_view host() const { return host_name; }
+
+    /// Get the data stored in the receive buffer.
+    /// \throw std::runtime_error if the receive thread errored.
+    std::vector<char> buffer() {
+        std::unique_lock lock{mtx};
+        if (recv_exception) {
+            auto except = std::move(recv_exception);
+            recv_exception = nullptr;
+            std::rethrow_exception(except);
+        }
+        auto ret = std::move(recv_buffer);
+        recv_buffer = {};
+        return ret;
     }
 
     /// Connect to a server.
@@ -77,7 +130,7 @@ public:
 
         /// Wait for the receive thread to stop if we're reusing this client.
         while (stop_receiving and thread_running) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        std::unique_lock lock{swap_lock};
+        std::unique_lock lock{mtx};
 
         /// Let openssl figure out the TLS version.
         const SSL_METHOD* method = TLS_client_method();
@@ -156,12 +209,12 @@ public:
         if (res != 1) raise("OpenSSL: Could not verify remote certificate hostname");
 
         /// We're connected!
+        host_name = host;
         connected = true;
     }
 
     /// Close the connection.
     void close() {
-        std::unique_lock lock{swap_lock};
         if (bio) {
             BIO_free_all(bio);
             bio = nullptr;
@@ -190,7 +243,7 @@ public:
         if (size > std::numeric_limits<int>::max()) raise("SSL client send size too large");
 
         /// Send the data.
-        std::unique_lock lock{swap_lock};
+        std::unique_lock lock{mtx};
         auto res = BIO_write(bio, data, int(size));
         if (res != int(size)) raise("OpenSSL: BIO_write() failed");
     }
@@ -209,6 +262,7 @@ public:
     /// \param us_timeout How long to wait between each attempted receive (in microseconds).
     /// \returns The number of bytes received.
     /// \throws std::runtime_error If the receive fails.
+    template <bool lck = true>
     size_t recv(char* data, size_t size, size_t us_interval = 50) {
         if (not connected) raise("SSL client not connected");
         if (thread_running and std::this_thread::get_id() != recv_thread.get_id()) raise("Cannot recv() while receive thread is running");
@@ -216,11 +270,12 @@ public:
 
         /// Receive data.
         for (;;) {
-            std::unique_lock lock{swap_lock};
+            std::unique_lock lock{mtx, std::defer_lock};
+            if constexpr (lck) lock.lock();
             auto n_read = BIO_read(bio, data, int(size));
             if (n_read < 0) {
                 if (not BIO_should_retry(bio)) raise("OpenSSL: BIO_read() failed");
-                lock.unlock();
+                if constexpr (lck) lock.unlock();
                 std::this_thread::sleep_for(std::chrono::microseconds(us_interval));
                 continue;
             }
@@ -228,66 +283,59 @@ public:
         }
     }
 
-    /// Receive data in a separate thread and call a callback whenever data is received.
+    /// Receive data in a separate thread.
     ///
     /// This creates a dedicated thread which repeatedly calls recv(), storing the received
-    /// data in a buffer and calling a user-supplied callback when enough data has accumulated.
-    /// The thread is joined when it errors, the SSL client is destroyed, or when close()
+    /// data in a buffer. The thread is joined when it errors, the client is destroyed, or close()
     /// or stop_receiving() is called.
     ///
-    /// \param min_size The minimum number of bytes to receive before calling the callback.
-    ///     If the receive buffer contains fewer bytes than this, the callback will not be called.
-    ///     If the size is 0, the callback will always be called.
-    /// \param callback The callback to call when data is received. It should return the number
-    ///     of bytes to remove from the receive buffer.
-    /// \param error_callback The callback to call if an error occurs.
-    /// \throws std::runtime_error If the receive thread cannot be created.
-    template <typename recv_data_type>
-    void recv_async( // clang-format off
-        size_t min_size,
-        std::function<size_t(const recv_data_type&)> callback,
-        std::function<void(const std::exception&)> error_callback
-    ) {
+    /// \throws std::runtime_error If the thread cannot be created.
+    void recv_async() {
         if (not connected) raise("SSL client not connected");
         if (thread_running) raise("SSL client already receiving");
         if (stop_receiving) raise("SSL client shutting down");
-        if (min_size > std::numeric_limits<int>::max()) raise("SSL client recv size too large");
 
         /// Create the receive thread.
-        recv_thread = std::thread([
-            this,
-            min_size,
-            callback = std::move(callback),
-            error_callback = std::move(error_callback)
-        ]() {
-            try {
-                /// Clear the buffer.
-                thread_running = true;
-                recv_data_type recv_buffer;
+        recv_thread = std::thread([this]() {
+            /// Signal that the thread has exited.
+            defer {
+                thread_running = false;
+                stop_receiving = false;
+                cv.notify_all();
+            };
 
-                /// If min_size is small, we can avoid reallocations by using a larger buffer.
-                size_t reserve = std::max(min_size, size_t(1024));
+            try {
+                /// Grow the receive buffer as needed.
+                static constexpr size_t grow_by = 1024;
+
+                /// Clear the buffer.
+                {
+                    std::unique_lock lock{mtx};
+                    thread_running = true;
+                    recv_buffer.clear();
+                }
+
 
                 /// Receive data.
                 while (not stop_receiving) {
+                    /// Make sure we don't try to move this while we're receiving.
+                    std::unique_lock lock{mtx};
+                    if (stop_receiving) break;
+
                     /// Reserve more space in the buffer.
                     auto sz = recv_buffer.size();
-                    recv_buffer.resize(sz + reserve);
+                    if (recv_buffer.capacity() < sz + grow_by) recv_buffer.resize(sz + grow_by);
 
                     /// Receive data.
-                    auto n_read = recv(recv_buffer.data() + sz, reserve, 100'000);
+                    auto n_read = recv<false>(recv_buffer.data() + sz, recv_buffer.size() - sz, 100'000);
                     recv_buffer.resize(sz + n_read);
-
-                    /// Call the callback if we have enough data.
-                    if (n_read < min_size) continue;
-                    std::unique_lock lock{swap_lock};
-                    auto processed = callback(recv_buffer);
-                    lock.unlock();
-                    recv_buffer.erase(recv_buffer.begin(), recv_buffer.begin() + processed);
                 }
-            } catch (const std::exception& e) { error_callback(e); }
+            } catch (const std::exception& e) {
+                std::unique_lock lock{mtx};
+                recv_exception = std::make_exception_ptr(e);
+            }
         });
-    } // clang-format on
+    }
 };
 
 } // namespace net::ssl
