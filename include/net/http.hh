@@ -71,7 +71,7 @@ struct response {
     u32 status{};
 
     response& expect(u32 code) {
-        if (status != code) throw std::runtime_error(fmt::format("Expected status {}, but was {}", status, code));
+        if (status != code) throw std::runtime_error(fmt::format("Expected status {}, but was {}", code, status));
         return *this;
     }
 };
@@ -103,13 +103,16 @@ struct request {
 
     /// Send the request over a connexion.
     template <typename conn_t>
-    response<body_type> send(conn_t& conn) {
+    void send(conn_t& conn) {
         std::string buf = fmt::format("GET {} HTTP/1.1\r\n", uri.path);
         if (not uri.params.empty()) {
             buf += '?';
-            buf += fmt::join(uri.params, "&", [](auto& out, auto& pair) {
-                out += fmt::format("{}={}", pair.first, pair.second);
-            });
+            bool first = true;
+            for (const auto& [k, v] : uri.params.values) {
+                if (not first) buf += '&';
+                else first = false;
+                buf += fmt::format("{}={}", k, v);
+            }
         }
 
         for (const auto& [key, value] : hdrs.values) buf += fmt::format("{}: {}\r\n", key, value);
@@ -154,7 +157,7 @@ constexpr inline const char charmap_vchar[128] = {
 	T,T,T,T,T,T,T,F,
 };
 
-constexpr inline const unsigned char charmap_field_vchar[256] = {
+constexpr inline const unsigned char charmap_text[256] = {
 	F,F,F,F,F,F,F,F,F,F,
 	F,F,F,F,F,F,F,F,F,F,
 	F,F,F,F,F,F,F,F,F,F,
@@ -211,8 +214,8 @@ constexpr inline bool isvchar(char c) {
 }
 
 /// See RFC 7230.
-constexpr inline bool is_field_vchar(unsigned char c) {
-    return charmap_field_vchar[c];
+constexpr inline bool istext(unsigned char c) {
+    return charmap_text[c];
 }
 
 /// See RFC 7230.
@@ -229,28 +232,50 @@ inline i8 xtonum(char c) {
 
 /// Parser return code.
 enum struct http_parse_result_code {
-    success,
-    incomplete,
-    error,
+    success = 1,
+    incomplete = 2,
+    error = 3,
 };
 
 /// Parser return value.
 struct http_parse_result {
-    http_parse_result_code code = http_parse_result_code::incomplete;
-    std::exception_ptr error = nullptr;
+    http_parse_result_code code;
+    std::exception_ptr error;
+
+    http_parse_result() {}
+    http_parse_result(http_parse_result_code code, std::exception_ptr e) : code(code), error(e) {}
 };
 
 /// HTTP request/response parser.
-template <typename obj = request<std::vector<char>>>
-co_generator<http_parse_result> parse(std::string_view& input, obj& o) {
+///
+/// For the sake of your own sanity, please refrain from invoking this function directly.
+/// It is fairly complicated for performance reasons, and requires setup from the caller
+/// to make sure the parser state is handled correctly.
+///
+/// This function never throws an exception. If an exception is thrown during parsing,
+/// it is stored in the result and can be rethrown by the caller.
+///
+/// \tparam obj The type of the object that we want to parse.
+/// \param input The input buffer.
+/// \param consumed How many characters have been consumed from the input buffer.
+/// \param o The output object.
+template <typename obj = request<std::string>>
+co_generator<http_parse_result> parser(std::string_view& input, u64& consumed, obj& o) noexcept {
     /// Parser state.
     std::string parse_buffer1;
     std::string parse_buffer2;
-    const char* const data = input.data();
-    const char* const end = data + input.size();
-    u64 i;
+    const char* data = input.data();
+    const char* end = data + input.size();
+    u64 i = 0;
     u64 start;
     u8 fst;
+
+    /// Make sure there is data to parse.
+    while (data == end) {
+        co_yield http_parse_result{http_parse_result_code::incomplete, nullptr};
+        data = input.data();
+        end = input.end();
+    }
 
     /// Go to the entry point.
     goto l_start_line;
@@ -267,15 +292,25 @@ name:
 #define L_DECLS(...) __label__ __VA_ARGS__
 
 /// This is just to avoid indenting everything by one more level.
-#define SECTION(name) if constexpr (is<obj, name<std::vector<char>>>)
+#define SECTION(name) if constexpr (is<obj, name<std::vector<char>>> or is<obj, name<std::string>>)
 
 /// Move to next character and jump to a label; if we're at the end of the input, suspend.
-#define jmp(l)                                                                       \
-    do {                                                                             \
-        i++;                                                                         \
-        if (data + i == end) [[unlikely]]                                            \
-            co_yield http_parse_result{http_parse_result_code::incomplete, nullptr}; \
-        goto l;                                                                      \
+#define jmp(l)                                                                               \
+    do {                                                                                     \
+        i++;                                                                                 \
+        static constexpr void* lval = &&l;                                                          \
+        static constexpr void* acceptval = &&l_accept;                                              \
+        if (lval != acceptval) {                                                   \
+            if (data + i == end) [[unlikely]] {                                              \
+                consumed += i;                                                               \
+                do {                                                                         \
+                    co_yield http_parse_result{http_parse_result_code::incomplete, nullptr}; \
+                    data = input.data();                                                     \
+                    end = input.end();                                                       \
+                } while (data == end);                                                       \
+            }                                                                                \
+        }                                                                                    \
+        goto l;                                                                              \
     } while (0)
 
 #define jmp_if_req(l)       \
@@ -341,7 +376,8 @@ name:
             l_uri_fragment_init, l_uri_fragment,
             l_uri_fragment_percent, l_uri_fragment_percent_2,
             l_ws_after_uri,
-            l_status_2nd, l_status_3rd, l_reason_phrase,
+            l_status_2nd, l_status_3rd, l_first_ws_after_status,
+            l_ws_after_status, l_reason_phrase,
             l_H, l_HT, l_HTT, l_HTTP, l_http_ver_maj, l_http_ver_rest,
             l_http_ver_min, l_ws_after_ver, l_needs_lf
         );
@@ -400,7 +436,7 @@ name:
 
         /// Parse the start of a URI.
         L (l_uri_path_init) { start = i; /** fallthrough **/ }
-        L (l_uri_path) {
+        L_SEC (l_uri_path, request) {
             switch (data[i]) {
                 case '?': MK_URI(l_uri_param_name_init);
                 case '%':
@@ -566,7 +602,7 @@ name:
             switch (data[i]) {
                 case '0':
                     o.proto = 10;
-                    break;
+                    jmp(l_ws_after_ver);
                 case '1':
                     o.proto = 11;
                     jmp(l_ws_after_ver);
@@ -605,16 +641,34 @@ name:
         L_SEC (l_status_3rd, response) {
             if (std::isdigit(data[i])) {
                 o.status += (data[i] - '0');
-                jmp(l_reason_phrase);
+                jmp(l_first_ws_after_status);
             }
             ERR("Status code may only contain digits");
         }
 
+        L_SEC (l_first_ws_after_status, response) {
+            switch (data[i]) {
+                case ' ': jmp(l_ws_after_status);
+                case '\r': jmp(l_needs_lf);
+                case '\n': jmp(l_headers);
+                default: ERR("Invalid character after status code: {}", data[i]);
+            }
+        }
+
+        L_SEC (l_ws_after_status, response) {
+            switch (data[i]) {
+                case ' ': jmp(l_ws_after_status);
+                case '\r': jmp(l_needs_lf);
+                case '\n': jmp(l_headers);
+                default: goto l_reason_phrase; /// (!)
+            }
+        }
+
         L_SEC (l_reason_phrase, response) {
-            if (not istchar(data[i])) {
+            if (not istext(data[i])) {
                 if (data[i] == '\r') jmp(l_needs_lf);
                 if (data[i] == '\n') jmp(l_headers);
-                ERR("Reason phrase contains invalid character");
+                ERR("Reason phrase contains invalid character: '{}'", data[i]);
             }
             jmp(l_reason_phrase);
         }
@@ -679,7 +733,7 @@ name:
                 case ' ':
                 case '\t': jmp(l_ws_after_colon);
                 default:
-                    if (is_field_vchar(data[i])) {
+                    if (istext(data[i])) {
                         start = i;
                         jmp(l_value);
                     }
@@ -699,7 +753,7 @@ name:
                     append_header();
                     jmp(l_start);
                 default:
-                    if (not is_field_vchar(data[i])) ERR("Invalid character in header value: {}", data[i]);
+                    if (not istext(data[i])) ERR("Invalid character in header value: {}", data[i]);
                     jmp(l_value);
             }
         }
@@ -716,7 +770,7 @@ name:
                     append_header();
                     jmp(l_start);
                 default:
-                    if (is_field_vchar(data[i])) jmp(l_value);
+                    if (istext(data[i])) jmp(l_value);
                     ERR("Invalid character in header after value: {}", data[i]);
             }
         }
@@ -743,7 +797,8 @@ name:
 
     /// Done!
     L (l_accept) {
-        co_yield http_parse_result{};
+        consumed += i;
+        co_yield http_parse_result{http_parse_result_code::success, nullptr};
         co_return;
     }
 
@@ -765,9 +820,10 @@ template <typename backend_t = tcp::client>
 class client {
     using backend_type = backend_t;
     backend_type conn;
+    std::vector<char> buffer;
 
 public:
-    explicit client(backend_type&& conn) : conn(std::move(conn)) { conn.recv_async(); }
+    explicit client(backend_type&& conn) : conn(std::move(conn)) {}
 
     /// Perform a request.
     ///
@@ -786,21 +842,51 @@ public:
         req.send(conn);
 
         /// Read the response.
-        std::vector<char> buf;
+        auto res = response<body_t>{};
         auto now = chrono::high_resolution_clock::now();
-        for (;;) {
-            /// Read the next chunk.
-            buf += conn.buffer();
 
-            /// Check if the response is complete.
-            if (buf.size() >= 4 and std::memcmp(buf.data() + buf.size() - 4, "\r\n\r\n", 4) == 0) break;
+        /// Create a parser.
+        std::string_view sv;
+        u64 consumed = 0;
+        auto parser_coro = detail::parser(sv, consumed, res);
+        auto parser = parser_coro.begin();
+        for (;;) {
+            /// Allocate space in the buffer.
+            static constexpr u64 increment = 1024;
+            auto old_size = buffer.size();
+            buffer.resize(old_size + increment);
+
+            /// Receive data.
+            auto recvd = conn.recv(buffer.data() + old_size, increment, us_timeout.count());
+            if (recvd == 0) throw std::runtime_error("Connection closed by peer");
+
+            /// Update the string view.
+            buffer.resize(old_size + recvd);
+            sv = std::string_view{buffer};
+
+            /// Advance the parser.
+            auto [result, err] = *++parser;
+
+            /// Check for errors.
+            if (result == detail::http_parse_result_code::error) {
+                std::rethrow_exception(err);
+                UNREACHABLE();
+            }
+
+            /// Stop if we're done.
+            if (result == detail::http_parse_result_code::success) {
+                buffer.erase(buffer.begin(), buffer.begin() + consumed);
+                break;
+            }
+            ASSERT(result == detail::http_parse_result_code::incomplete);
 
             /// Check if the timeout has been reached.
             if (us_timeout > 0us and chrono::high_resolution_clock::now() - now > us_timeout)
                 throw std::runtime_error("Timeout reached");
         }
 
-        /// Parse the response.
+        /// Done!
+        return res;
     }
 
     /// Perform a GET request.
@@ -811,6 +897,18 @@ public:
     template <typename body_t = std::string>
     response<body_t> get(url url, headers hdrs = {}) {
         return perform(request<body_t>{std::move(url), std::move(hdrs)});
+    }
+
+    /// Perform a GET request.
+    ///
+    /// \param path The path to GET.
+    /// \param hdrs The headers to send.
+    /// \return The response.
+    template <typename body_t = std::string>
+    response<body_t> get(std::string_view path, headers hdrs = {}) {
+        url u{};
+        u.path = path;
+        return perform(request<body_t>{std::move(u), std::move(hdrs)});
     }
 };
 

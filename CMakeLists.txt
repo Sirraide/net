@@ -40,6 +40,7 @@ add_library(options INTERFACE)
 target_compile_options(options INTERFACE
         -Wall -Wextra -Wundef -Werror=return-type
         -Wno-unused-function -Wno-unused-parameter -Wno-unused-variable -Wno-subobject-linkage
+        -Wno-unused-label
         -Wno-empty-body -Wno-nonnull -Wno-invalid-offsetof -fdiagnostics-color=always)
 
 if (CMAKE_BUILD_TYPE STREQUAL "Release")
