@@ -307,69 +307,116 @@ inline std::string encode_uri(std::string_view raw) {
     return encoded;
 }
 
-template <typename T>
-struct co_generator {
-    static_assert(!std::is_void_v<T>, "co_generator: template parameter must not be void");
+template <std::movable value_t>
+struct generator {
+    static_assert(!std::is_void_v<value_t>, "generator: template parameter must not be void");
     struct promise_type;
-    using co_handle = std::coroutine_handle<promise_type>;
 
+    /// Actual type of the generated values.
+    using value_type = std::remove_cvref_t<value_t>;
+
+    /// Reference/pointer to the value type.
+    using reference = std::add_lvalue_reference_t<value_type>;
+    using pointer = std::add_pointer_t<value_type>;
+
+    /// Coroutine handle type.
+    using handle_type = std::coroutine_handle<promise_type>;
+
+    /// Coroutine promise type.
     struct promise_type {
-        T current_value;
+        /// Value.
+        value_type current_value;
         promise_type() = default;
 
-        co_generator get_return_object() { return {co_handle::from_promise(*this)}; }
-        std::suspend_never initial_suspend() { return {}; }
+        /// API.
+        generator get_return_object() { return {handle_type::from_promise(*this)}; }
+        std::suspend_always initial_suspend() { return {}; }
         std::suspend_always final_suspend() noexcept { return {}; }
-        void unhandled_exception() { std::terminate(); }
-        template <std::convertible_to<T> U>
-        std::suspend_always yield_value(U&& u) {
-            current_value = std::forward<U>(u);
+
+        /// Disallow co_await.
+        void await_transform() = delete;
+
+        /// Rethrow exceptions.
+        void unhandled_exception() { throw; }
+
+        /// co_yield.
+        std::suspend_always yield_value(std::convertible_to<value_type> auto&& res) {
+            current_value = std::forward<decltype(res)>(res);
             return {};
         }
-        void return_void() {}
+
+        /// co_return.
+        void return_void() noexcept {}
     };
 
-    struct sentinel {};
-
+    /// Iterator to support range-based for loops.
     struct iterator {
-        co_generator* gen;
-        iterator(co_generator* _gen) : gen(_gen) {}
-        T operator*() {
-            return gen->handle.promise().current_value;
-        }
+        handle_type handle;
 
-        T* operator->() {
-            return &gen->handle.promise().current_value;
-        }
+        iterator() : handle(nullptr) {}
+        iterator(handle_type h) : handle(h) {}
+
+        reference operator*() { return handle.promise().current_value; }
+        pointer operator->() { return &handle.promise().current_value; }
 
         iterator& operator++() {
-            gen->handle.resume();
+            handle.resume();
             return *this;
         }
 
-        bool operator==(const sentinel& s) { return !gen || gen->handle.done(); }
+        bool operator==(std::default_sentinel_t) {
+            return !handle || handle.done();
+        }
     };
 
-    const sentinel _sentinel{};
-    co_handle handle;
+private:
+    /// Coroutine handle.
+    handle_type handle;
+public:
 
-    co_generator(co_handle h) : handle(h) {}
-    co_generator(const co_generator&) = delete;
-    co_generator(co_generator&& other) noexcept : handle(other.handle) { other.handle = nullptr; }
-    ~co_generator() {
+    /// Set the handle.
+    generator(handle_type h) : handle(h) {}
+
+    /// Copying coroutines is nonsense.
+    generator(const generator&) = delete;
+    generator& operator=(const generator&) = delete;
+
+    /// Moving is ok.
+    generator(generator&& other) noexcept : handle(other.handle) { other.handle = nullptr; }
+    generator& operator=(generator&& other) noexcept {
+        if (handle) handle.destroy();
+        handle = other.handle;
+        other.handle = nullptr;
+    }
+
+    /// Cleanup.
+    ~generator() {
         if (handle) handle.destroy();
     }
-    operator co_handle() const { return handle; }
 
-    T operator()() {
-        T t = std::move(handle.promise().current_value);
+    /// Advance the coroutine and return the current value.
+    /// Be careful when using this since there's no way to check if the coroutine is done.
+    reference operator()() {
         handle.resume();
-        return t;
+        return handle.promise().current_value;
     }
 
-    iterator begin() { return {this}; }
-    const sentinel& end() { return _sentinel; }
+    iterator begin() { handle.resume(); return {handle}; }
+    std::default_sentinel_t end() { return {}; }
 };
+
+using resumable = generator<bool>;
+
+#define YIELD_INCOMPLETE() \
+    do {                   \
+        co_yield false;    \
+    } while (0)
+
+#define YIELD_SUCCESS() \
+    do {                \
+        co_yield true;  \
+        co_return;      \
+    } while (0)
 
 /// Enum arithmetic.
 #define ENUM_OPERATOR(op)                                                                                    \
