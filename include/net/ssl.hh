@@ -27,13 +27,6 @@ class client {
     BIO* bio = nullptr;
     SSL* ssl = nullptr;
     bool connected = false;
-    bool stop_receiving = false;
-    bool thread_running = false;
-    std::thread recv_thread;
-    std::mutex mtx;
-    std::condition_variable cv;
-    std::exception_ptr recv_exception = nullptr;
-    std::vector<char> recv_buffer;
     std::string host_name;
 
     /// Get the current error message.
@@ -56,68 +49,11 @@ public:
     client(std::string_view host, u16 port) { connect(host, port); }
     ~client() { close(); }
     nocopy(client);
-    client(client&& other) noexcept : ctx(nullptr), bio(nullptr), ssl(nullptr) { *this = std::move(other); }
-    client& operator=(client&& other) noexcept {
-        if (this == std::addressof(other)) { return *this; }
-
-        /// Shut us down.
-        std::unique_lock lock{mtx};
-        if (thread_running) {
-            stop_receiving = true;
-            cv.wait(lock, [this] { return not thread_running; });
-            recv_thread.join();
-        }
-        close();
-
-        /// Take over the other connexion.
-        std::unique_lock other_lock{other.mtx};
-
-        /// We need to stop and restart the other thread if it's running.
-        bool restart = other.thread_running;
-        if (restart) {
-            other.stop_receiving = true;
-            other.cv.wait(other_lock, [&other] { return not other.thread_running; });
-            other.recv_thread.join();
-        }
-
-        /// Move the connexion state.
-        ctx = other.ctx;
-        bio = other.bio;
-        ssl = other.ssl;
-        connected = other.connected;
-        stop_receiving = false;
-        thread_running = false;
-        recv_exception = std::move(other.recv_exception);
-        recv_buffer = std::move(other.recv_buffer);
-        other.ctx = nullptr;
-        other.bio = nullptr;
-        other.ssl = nullptr;
-        other.connected = false;
-        other.stop_receiving = false;
-        other.recv_exception = nullptr;
-        other.recv_buffer = {};
-
-        /// Restart the thread if needed.
-        if (restart) { recv_async(); }
-        return *this;
-    }
+    nomove(client);
 
     /// Returns the current host name or the empty string if not connected.
     [[nodiscard]] std::string_view host() const { return host_name; }
 
-    /// Get the data stored in the receive buffer.
-    /// \throw std::runtime_error if the receive thread errored.
-    std::vector<char> buffer() {
-        std::unique_lock lock{mtx};
-        if (recv_exception) {
-            auto except = std::move(recv_exception);
-            recv_exception = nullptr;
-            std::rethrow_exception(except);
-        }
-        auto ret = std::move(recv_buffer);
-        recv_buffer = {};
-        return ret;
-    }
 
     /// Connect to a server.
     ///
@@ -127,10 +63,6 @@ public:
     void connect(std::string_view host, u16 port) {
         /// Make sure we don't connect twice.
         if (connected) raise("SSL client already connected");
-
-        /// Wait for the receive thread to stop if we're reusing this client.
-        while (stop_receiving and thread_running) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        std::unique_lock lock{mtx};
 
         /// Let openssl figure out the TLS version.
         const SSL_METHOD* method = TLS_client_method();
@@ -225,11 +157,6 @@ public:
             ctx = nullptr;
         }
 
-        if (recv_thread.joinable()) {
-            stop_receiving = true;
-            recv_thread.join();
-        }
-
         connected = false;
     }
 
@@ -243,7 +170,6 @@ public:
         if (size > std::numeric_limits<int>::max()) raise("SSL client send size too large");
 
         /// Send the data.
-        std::unique_lock lock{mtx};
         auto res = BIO_write(bio, data, int(size));
         if (res != int(size)) raise("OpenSSL: BIO_write() failed");
     }
@@ -262,79 +188,20 @@ public:
     /// \param us_timeout How long to wait between each attempted receive (in microseconds).
     /// \returns The number of bytes received.
     /// \throws std::runtime_error If the receive fails.
-    template <bool lck = true>
     size_t recv(char* data, size_t size, size_t us_interval = 50) {
         if (not connected) raise("SSL client not connected");
-        if (thread_running and std::this_thread::get_id() != recv_thread.get_id()) raise("Cannot recv() while receive thread is running");
         if (not size or size > std::numeric_limits<int>::max()) raise("SSL client recv must be between 1 and {}", std::numeric_limits<int>::max());
 
         /// Receive data.
         for (;;) {
-            std::unique_lock lock{mtx, std::defer_lock};
-            if constexpr (lck) lock.lock();
             auto n_read = BIO_read(bio, data, int(size));
             if (n_read < 0) {
                 if (not BIO_should_retry(bio)) raise("OpenSSL: BIO_read() failed");
-                if constexpr (lck) lock.unlock();
                 std::this_thread::sleep_for(std::chrono::microseconds(us_interval));
                 continue;
             }
             return n_read;
         }
-    }
-
-    /// Receive data in a separate thread.
-    ///
-    /// This creates a dedicated thread which repeatedly calls recv(), storing the received
-    /// data in a buffer. The thread is joined when it errors, the client is destroyed, or close()
-    /// or stop_receiving() is called.
-    ///
-    /// \throws std::runtime_error If the thread cannot be created.
-    void recv_async() {
-        if (not connected) raise("SSL client not connected");
-        if (thread_running) raise("SSL client already receiving");
-        if (stop_receiving) raise("SSL client shutting down");
-
-        /// Create the receive thread.
-        recv_thread = std::thread([this]() {
-            /// Signal that the thread has exited.
-            defer {
-                thread_running = false;
-                stop_receiving = false;
-                cv.notify_all();
-            };
-
-            try {
-                /// Grow the receive buffer as needed.
-                static constexpr size_t grow_by = 1024;
-
-                /// Clear the buffer.
-                {
-                    std::unique_lock lock{mtx};
-                    thread_running = true;
-                    recv_buffer.clear();
-                }
-
-
-                /// Receive data.
-                while (not stop_receiving) {
-                    /// Make sure we don't try to move this while we're receiving.
-                    std::unique_lock lock{mtx};
-                    if (stop_receiving) break;
-
-                    /// Reserve more space in the buffer.
-                    auto sz = recv_buffer.size();
-                    if (recv_buffer.capacity() < sz + grow_by) recv_buffer.resize(sz + grow_by);
-
-                    /// Receive data.
-                    auto n_read = recv<false>(recv_buffer.data() + sz, recv_buffer.size() - sz, 100'000);
-                    recv_buffer.resize(sz + n_read);
-                }
-            } catch (const std::exception& e) {
-                std::unique_lock lock{mtx};
-                recv_exception = std::make_exception_ptr(e);
-            }
-        });
     }
 };
 

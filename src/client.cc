@@ -6,11 +6,12 @@
 
 namespace tcp = net::tcp;
 namespace http = net::http;
+namespace https = net::https;
 namespace ws = net::websock;
 namespace ssl = net::ssl;
 
 int main() try {
-    http::client client{tcp::client{"localhost", 8080}};
+    http::client client{"localhost", 8080};
     auto res = client.get("/test.html").expect(200);
     fmt::print("Response headers:\n");
     for (const auto &[k, v] : res.hdrs.values) {

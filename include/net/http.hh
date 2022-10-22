@@ -965,14 +965,15 @@ url::url(std::string_view sv) {
         throw std::runtime_error("Not a valid URL");
 }
 
-template <typename backend_t = tcp::client>
+template <typename backend_t = tcp::client, u16 default_port = 80>
 class client {
     using backend_type = backend_t;
     backend_type conn;
     std::vector<char> buffer;
 
 public:
-    explicit client(backend_type&& conn) : conn(std::move(conn)) {}
+    explicit client() : conn() {}
+    explicit client(std::string_view host_name, u16 port = default_port) : conn(host_name, port) {}
 
     /// Perform a request.
     ///
@@ -1051,10 +1052,14 @@ public:
 /// Perform a GET request.
 inline response get(std::string_view url) {
     return url.starts_with("https")
-               ? client(net::ssl::client()).get(url, {{"Connection", "close"}})
-               : client(net::tcp::client()).get(url, {{"Connection", "close"}});
+               ? client<net::ssl::client>().get(url, {{"Connection", "close"}})
+               : client<net::tcp::client>().get(url, {{"Connection", "close"}});
 }
 
 } // namespace net::http
+
+namespace net::https {
+    using client = http::client<net::ssl::client, 443>;
+} // namespace net::https
 
 #endif // NET_HTTP_HH
