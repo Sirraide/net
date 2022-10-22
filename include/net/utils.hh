@@ -1,6 +1,7 @@
 #ifndef NET_UTILS_HH
 #define NET_UTILS_HH
 
+#include <algorithm>
 #include <chrono>
 #include <coroutine>
 #include <cstdint>
@@ -417,6 +418,14 @@ using resumable = generator<bool>;
         co_yield true;  \
         co_return;      \
     } while (0)
+
+/// Convert a string to lowercase.
+inline std::string tolower(std::string_view str) {
+    std::string res;
+    res.resize(str.size());
+    std::ranges::transform(str, res.begin(), [](char c) { return std::tolower(c); });
+    return res;
+}
 
 /// Enum arithmetic.
 #define ENUM_OPERATOR(op)                                                                                    \

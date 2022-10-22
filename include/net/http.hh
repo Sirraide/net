@@ -24,20 +24,31 @@ enum struct method {
 };
 
 /// HTTP headers.
-struct smap {
+template <bool case_insensitive = false>
+struct smap_impl {
     std::unordered_map<std::string, std::string> values;
 
-    smap() = default;
-    smap(std::initializer_list<std::pair<const std::string, std::string>>&& init) : values(std::move(init)) {}
+    smap_impl() = default;
+    smap_impl(std::initializer_list<std::pair<const std::string, std::string>>&& init) {
+        if constexpr (case_insensitive) {
+            for (const auto& [k, v] : init) values[tolower(k)] = v;
+        } else {
+            values = init;
+        }
+    }
 
     /// Reference to a header value.
     struct smap_ref {
-        smap& parent;
+        smap_impl& parent;
         std::string key;
 
-        /// Create a reference to a header value.
-        smap_ref(smap& parent, std::string&& key) : parent(parent), key(std::move(key)) {}
+    private:
+        friend struct smap_impl;
 
+        /// Create a reference to a header value.
+        smap_ref(smap_impl& parent, std::string&& key) : parent(parent), key(std::move(key)) {}
+
+    public:
         /// Set the header value. This will append the value to the existing value,
         /// separated by a comma if the header already exists.
         smap_ref& operator=(std::string_view value) {
@@ -50,25 +61,34 @@ struct smap {
         operator bool() { return parent.values.contains(key); }
 
         /// Get the header value.
-        std::string_view operator*() { return parent.values.at(key); }
+        std::string_view& operator*() { return parent.values.at(key); }
+
+        /// Get the header value.
+        std::string_view* operator->() { return std::addressof(parent.values.at(key)); }
     };
 
     /// Get a reference to a header value.
-    smap_ref operator[](std::string_view key) { return {*this, std::string{key}}; }
+    smap_ref operator[](std::string_view key) {
+        if constexpr (case_insensitive) return {*this, tolower(key)};
+        else return {*this, std::string{key}};
+    }
 
     /// Check if there are elements in the map.
     bool empty() const { return values.empty(); }
 
     /// Check if a certain header exists.
-    bool has(const std::string& key) { return values.contains(key); }
+    bool has(const std::string& key) {
+        if constexpr (case_insensitive) return values.contains(tolower(key));
+        else return values.contains(key);
+    }
 };
 
 /// `smap` isn't very expressive.
-using headers = smap;
+using headers = smap_impl<true>;
 
 /// The body of a request/response may contain 0 bytes, for which reason we
 /// can't store it in a std::string.
-using octets = std::vector<std::byte>;
+using octets = std::vector<u8>;
 
 /// HTTP response.
 struct response {
@@ -87,7 +107,7 @@ struct url {
     std::string host;
     std::string path;
     std::string fragment;
-    smap params;
+    smap_impl<false> params;
     u16 port{};
 
     url() {}
@@ -966,10 +986,11 @@ url::url(std::string_view sv) {
 }
 
 template <typename backend_t = tcp::client, u16 default_port = 80>
-class client {
+struct client {
+protected:
     using backend_type = backend_t;
-    backend_type conn;
     std::vector<char> buffer;
+    backend_type conn;
 
 public:
     explicit client() : conn() {}
@@ -1059,7 +1080,7 @@ inline response get(std::string_view url) {
 } // namespace net::http
 
 namespace net::https {
-    using client = http::client<net::ssl::client, 443>;
+using client = http::client<net::ssl::client, 443>;
 } // namespace net::https
 
 #endif // NET_HTTP_HH

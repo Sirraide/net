@@ -44,7 +44,7 @@ target_compile_options(options INTERFACE
         -Wno-empty-body -Wno-nonnull -Wno-invalid-offsetof -fdiagnostics-color=always)
 
 if (CMAKE_BUILD_TYPE STREQUAL "Release")
-    target_compile_options(options INTERFACE -O3 -DNDEBUG)
+    target_compile_options(options INTERFACE -O3 -march=native -DNDEBUG)
 else ()
 	target_compile_options(options INTERFACE -O0 -ggdb -rdynamic)
 	target_link_options(options INTERFACE -rdynamic)
