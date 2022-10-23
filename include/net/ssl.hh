@@ -54,7 +54,6 @@ public:
     /// Returns the current host name or the empty string if not connected.
     [[nodiscard]] std::string_view host() const { return host_name; }
 
-
     /// Connect to a server.
     ///
     /// \param host The host to connect to.
@@ -181,26 +180,34 @@ public:
     template <typename data_t>
     void send(data_t&& data) { send(data.data(), data.size()); }
 
+    /// Receive more data.
+    ///
+    /// \param buffer The buffer to receive into
+    /// \param bytes The number of bytes to receive.
+    void recv(recvbuffer& v, size_t bytes = 0) {
+        v.allocate(bytes);
+        v.grow(recv(v.data(), std::min<u64>(v.capacity(), std::numeric_limits<int>::max()), bytes));
+    }
+
     /// Receive data from the server.
     ///
     /// \param data The buffer to receive the data into.
     /// \param size The size of the buffer (in bytes).
-    /// \param us_timeout How long to wait between each attempted receive (in microseconds).
+    /// \param at_least The number of bytes to receive. This function will loop
+    ///      until at least this many bytes have been received.
     /// \returns The number of bytes received.
     /// \throws std::runtime_error If the receive fails.
-    size_t recv(char* data, size_t size, size_t us_interval = 50) {
+    u64 recv(u8* data, u64 size, u64 at_least = 1) {
         if (not connected) raise("SSL client not connected");
-        if (not size or size > std::numeric_limits<int>::max()) raise("SSL client recv must be between 1 and {}", std::numeric_limits<int>::max());
+        if (not size or size > std::numeric_limits<int>::max()) raise("SSL client recv() size must be between 1 and {}", std::numeric_limits<int>::max());
 
         /// Receive data.
+        u64 n_read{};
         for (;;) {
-            auto n_read = BIO_read(bio, data, int(size));
-            if (n_read < 0) {
-                if (not BIO_should_retry(bio)) raise("OpenSSL: BIO_read() failed");
-                std::this_thread::sleep_for(std::chrono::microseconds(us_interval));
-                continue;
-            }
-            return n_read;
+            auto ret = BIO_read(bio, data, int(size));
+            if (ret < 0 and not not BIO_should_retry(bio)) raise("OpenSSL: BIO_read() failed");
+            n_read += ret;
+            if (n_read >= at_least) return n_read;
         }
     }
 };

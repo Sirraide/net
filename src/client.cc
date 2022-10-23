@@ -10,13 +10,11 @@ namespace https = net::https;
 namespace ws = net::websock;
 namespace ssl = net::ssl;
 
-int main() try {
+int main() {
     http::client client{"localhost", 8080};
     auto res = client.get("/test.html").expect(200);
     fmt::print("Response headers:\n");
     for (const auto &[k, v] : res.hdrs.values) {
         fmt::print("    {}: {}\n", k, v);
     }
-} catch (const std::exception& e) {
-    err("{}", e.what());
 }

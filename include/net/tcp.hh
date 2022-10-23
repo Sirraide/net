@@ -1,6 +1,7 @@
 #ifndef NET_TCP_HH
 #define NET_TCP_HH
 
+#include "common.hh"
 #include "utils.hh"
 
 #include <arpa/inet.h>
@@ -100,25 +101,34 @@ public:
         if (n == -1) raise("send() failed");
     }
 
+    /// Receive more data.
+    ///
+    /// \param buffer The buffer to receive into
+    /// \param bytes The number of bytes to receive.
+    void recv(recvbuffer& v, size_t bytes = 0) {
+        v.allocate(bytes);
+        v.grow(recv(v.data(), v.capacity(), bytes));
+    }
+
     /// Receive data from the server.
     ///
     /// \param data The buffer to receive the data into.
     /// \param size The size of the buffer (in bytes).
-    /// \param us_timeout How long to wait between each attempted receive (in microseconds).
+    /// \param at_least The number of bytes to receive. This function will loop
+    ///      until at least this many bytes have been received.
     /// \returns The number of bytes received.
     /// \throws std::runtime_error If the receive fails.
-    size_t recv(char* data, size_t size, size_t us_interval = 50) {
-        if (not size) return 0;
+    u64 recv(u8* data, u64 size, u64 at_least = 1) {
+        if (not connected) throw error("Cannot receive data on a disconnected socket");
+        if (at_least > size) throw error("Cannot receive more data than the buffer can hold");
 
         /// Receive data.
+        u64 n_read{};
         for (;;) {
-            ssize_t n_read;
-            n_read = ::recv(fd, data, size, 0);
-            if (n_read <= 0) {
-                if (errno == EINTR or errno == EAGAIN or errno == EWOULDBLOCK)
-                    std::this_thread::sleep_for(std::chrono::microseconds(us_interval));
-                else raise("recv() failed");
-            } else return n_read;
+            auto ret = ::recv(fd, data, size, 0);
+            if (ret < 0 and errno != EINTR and errno != EAGAIN) raise("recv() failed");
+            n_read += ret;
+            if (n_read >= at_least) return n_read;
         }
     }
 };

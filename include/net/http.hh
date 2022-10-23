@@ -61,10 +61,10 @@ struct smap_impl {
         operator bool() { return parent.values.contains(key); }
 
         /// Get the header value.
-        std::string_view& operator*() { return parent.values.at(key); }
+        std::string& operator*() { return parent.values.at(key); }
 
         /// Get the header value.
-        std::string_view* operator->() { return std::addressof(parent.values.at(key)); }
+        std::string* operator->() { return std::addressof(parent.values.at(key)); }
     };
 
     /// Get a reference to a header value.
@@ -263,18 +263,18 @@ inline i8 xtonum(char c) {
 name:
 
 /// Move to next character and jump to a label; if we're at the end of the input, suspend.
-#define jmp(l)                              \
-    do {                                    \
-        i++;                                \
-        if (data + i >= end) [[unlikely]] { \
-            consumed += i;                  \
-            do {                            \
-                YIELD_INCOMPLETE();         \
-                data = input.data();        \
-                end = input.end();          \
-            } while (data == end);          \
-        }                                   \
-        goto l;                             \
+#define jmp(l)                                                      \
+    do {                                                            \
+        i++;                                                        \
+        if (data + i >= end) [[unlikely]] {                         \
+            consumed += i;                                          \
+            do {                                                    \
+                YIELD_INCOMPLETE();                                 \
+                data = reinterpret_cast<const char*>(input.data()); \
+                end = data + input.size();                          \
+            } while (data == end);                                  \
+        }                                                           \
+        goto l;                                                     \
     } while (0)
 
 #define accept()       \
@@ -306,13 +306,13 @@ name:
     } while (0)
 
 /// Delegate to another parser.
-#define DELEGATE(func, ...)                     \
-    do {                                        \
-        input.remove_prefix(i);                 \
-        auto parse = func(__VA_ARGS__);         \
-        while (not parse()) YIELD_INCOMPLETE(); \
-        data = input.data();                    \
-        end = input.end();                      \
+#define DELEGATE(func, ...)                                 \
+    do {                                                    \
+        input = input.subspan(i);                           \
+        auto parse = func(__VA_ARGS__);                     \
+        while (not parse()) YIELD_INCOMPLETE();             \
+        data = reinterpret_cast<const char*>(input.data()); \
+        end = data + input.size();                          \
     } while (0)
 
 /// URI parser.
@@ -321,11 +321,11 @@ name:
 ///
 /// TODO: Make sure this complies with RFC 3986.
 template <bool incremental = true>
-resumable parse_uri(std::string_view& input, u64& consumed, url& uri) {
+resumable parse_uri(std::span<const u8> input, u64& consumed, url& uri) {
     /// Parse the request/status line.
     std::string parse_buffer1;
     std::string parse_buffer2;
-    const char* data = input.data();
+    const char* data = reinterpret_cast<const char*>(input.data());
     const char* end = data + input.size();
     u64 i = 0;
     u64 start;
@@ -335,8 +335,8 @@ resumable parse_uri(std::string_view& input, u64& consumed, url& uri) {
     while (data == end) {
         if constexpr (not incremental) ERR("Unexpected end of input");
         YIELD_INCOMPLETE();
-        data = input.data();
-        end = input.end();
+        data = reinterpret_cast<const char*>(input.data());
+        end = data + input.size();
     }
 
 /// Create a URI and return.
@@ -511,10 +511,10 @@ resumable parse_uri(std::string_view& input, u64& consumed, url& uri) {
 /// HTTP headers parser.
 ///
 /// This parses HTTP headers and the final CRLF that terminates them.
-resumable parse_headers(std::string_view& input, u64& consumed, headers& hdrs) {
+resumable parse_headers(std::span<const u8>& input, u64& consumed, headers& hdrs) {
     /// Parse the request/status line.
     std::string name;
-    const char* data = input.data();
+    const char* data = reinterpret_cast<const char*>(input.data());
     const char* end = data + input.size();
     u64 i = 0;
     u64 start;
@@ -522,8 +522,8 @@ resumable parse_headers(std::string_view& input, u64& consumed, headers& hdrs) {
     /// Make sure there is data to parse.
     while (data == end) {
         YIELD_INCOMPLETE();
-        data = input.data();
-        end = input.end();
+        data = reinterpret_cast<const char*>(input.data());
+        end = data + input.size();
     }
 
     /// Helper to add a header to the request.
@@ -636,9 +636,9 @@ resumable parse_headers(std::string_view& input, u64& consumed, headers& hdrs) {
 /// \param input The input buffer.
 /// \param consumed How many characters have been consumed from the input buffer.
 /// \param req The output request.
-resumable parse_request(std::string_view& input, u64& consumed, request& req) {
+resumable parse_request(std::span<const u8>& input, u64& consumed, request& req) {
     /// Parse the request/status line.
-    const char* data = input.data();
+    const char* data = reinterpret_cast<const char*>(input.data());
     const char* end = data + input.size();
     u64 i = 0;
     u64 start;
@@ -646,8 +646,8 @@ resumable parse_request(std::string_view& input, u64& consumed, request& req) {
     /// Make sure there is data to parse.
     while (data == end) {
         YIELD_INCOMPLETE();
-        data = input.data();
-        end = input.end();
+        data = reinterpret_cast<const char*>(input.data());
+        end = data + input.size();
     }
 
     /// Parser entry point.
@@ -799,17 +799,17 @@ resumable parse_request(std::string_view& input, u64& consumed, request& req) {
 /// \param input The input buffer.
 /// \param consumed How many characters have been consumed from the input buffer.
 /// \param res The output response.
-resumable parse_response(std::string_view& input, u64& consumed, response& res) {
+resumable parse_response(std::span<const u8>& input, u64& consumed, response& res) {
     /// Parse the request/status line.
-    const char* data = input.data();
+    const char* data = reinterpret_cast<const char*>(input.data());
     const char* end = data + input.size();
     u64 i = 0;
 
     /// Make sure there is data to parse.
     while (data == end) {
         YIELD_INCOMPLETE();
-        data = input.data();
-        end = input.end();
+        data = reinterpret_cast<const char*>(input.data());
+        end = data + input.size();
     }
 
     L (l_ws_after_uri) {
@@ -823,7 +823,7 @@ resumable parse_response(std::string_view& input, u64& consumed, response& res) 
                 res.proto = 9;
                 accept();
             case 'H': jmp(l_H);
-            default: ERR("Invalid character after URI: {}", data[i]);
+            default: ERR("Invalid character after URI: '{}'", data[i]);
         }
     }
 
@@ -980,7 +980,11 @@ resumable parse_response(std::string_view& input, u64& consumed, response& res) 
 url::url(std::string_view sv) {
     /// Parse the url.
     u64 consumed = 0;
-    auto parser = detail::parse_uri<false>(sv, consumed, *this);
+    auto parser = detail::parse_uri<false>(
+        std::span<const u8>{reinterpret_cast<const u8*>(sv.data()), sv.size()},
+        consumed,
+        *this
+    );
     if (not parser() or consumed != sv.size())
         throw std::runtime_error("Not a valid URL");
 }
@@ -989,7 +993,7 @@ template <typename backend_t = tcp::client, u16 default_port = 80>
 struct client {
 protected:
     using backend_type = backend_t;
-    std::vector<char> buffer;
+    recvbuffer buffer;
     backend_type conn;
 
 public:
@@ -1015,32 +1019,29 @@ public:
         auto res = response{};
         auto now = chrono::high_resolution_clock::now();
 
+        /// TODO: recv in separate thread w/ std::async and std::future to allow for timeouts.
         /// Create a parser.
-        std::string_view sv;
+        std::span<const u8> span;
         u64 consumed = 0;
-        auto parser = detail::parse_response(sv, consumed, res);
+        auto parser = detail::parse_response(span, consumed, res);
         for (;;) {
             /// Allocate space in the buffer.
             static constexpr u64 increment = 1024;
-            auto old_size = buffer.size();
-            buffer.resize(old_size + increment);
+            buffer.allocate(increment);
 
             /// Receive data.
-            auto recvd = conn.recv(buffer.data() + old_size, increment, us_timeout.count());
-            if (recvd == 0) throw std::runtime_error("Connection closed by peer");
+            conn.recv(buffer);
+            if (buffer.empty()) throw std::runtime_error("Connection closed by peer");
 
-            /// Update the string view.
-            buffer.resize(old_size + recvd);
-            sv = std::string_view{buffer};
+            /// Update the span.
+            span = buffer.span();
 
             /// Advance the parser.
             auto done = parser();
+            buffer.skip(consumed);
 
             /// Stop if we're done.
-            if (done) {
-                buffer.erase(buffer.begin(), buffer.begin() + consumed);
-                break;
-            }
+            if (done) break;
 
             /// Check if the timeout has been reached.
             if (us_timeout > 0us and chrono::high_resolution_clock::now() - now > us_timeout)
@@ -1048,6 +1049,7 @@ public:
         }
 
         /// Done!
+        buffer.erase_to_offset();
         return res;
     }
 

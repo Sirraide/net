@@ -18,6 +18,7 @@
 #include <type_traits>
 #include <unistd.h>
 #include <vector>
+#include <span>
 
 #define CAT_(X, Y) X##Y
 #define CAT(X, Y)  CAT_(X, Y)
