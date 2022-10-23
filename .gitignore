@@ -1,6 +1,7 @@
 .idea/
 out/
 cert/
+docs/
 
 client
 server
