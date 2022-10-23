@@ -22,15 +22,14 @@ void httpclient() {
 }
 
 void websocket() {
-    ws::client<net::tcp::client> client;
+    ws::client client;
     client.on_close = [](ws::message&& m) {
         if (auto code = m.buffer.try_extract<u16>(); code) fmt::print("Websocket closed: {} {}\n", ntohs(*code), m.buffer.str());
         else fmt::print("Websocket closed\n");
     };
-    client.on_text = client.on_binary = [](ws::message&& m) {
-        fmt::print("Received: {}\n", m.buffer.str());
-    };
-    client.connect(false, "localhost", "/", 8080);
+    client.on_text = client.on_binary = [](ws::message&& m) { fmt::print("Received: {}\n", m.buffer.str()); };
+    client.on_ready = [&] { client.send_frame(ws::opcode::text, "Hello, world!"); };
+    client.connect(true, "echo.websocket.events", "/");
 }
 
 int main() {

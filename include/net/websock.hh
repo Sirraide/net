@@ -5,11 +5,11 @@
 #include "http.hh"
 #include "tcp.hh"
 
+#include <endian.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <span>
-#include <endian.h>
 
 namespace net::websock {
 using namespace net::http;
@@ -87,6 +87,9 @@ public:
 
     /// Called whenever an unknown message is received.
     std::function<void(message&&)> on_unknown;
+
+    /// Called when the WebSocket is ready to send messages.
+    std::function<void()> on_ready;
 
     /// Client constructor. This installs default callbacks.
     client() {
@@ -216,7 +219,7 @@ public:
 
         /// We're connected!
         state = connection_state::open;
-        send_frame(opcode::text, "Hello, world!");
+        if (on_ready) on_ready();
 
         /// Run the read loop.
         while (state == connection_state::open) {
@@ -259,7 +262,6 @@ public:
         if (state == connection_state::open) send_frame(opcode::close, {});
     }
 
-private:
     /// Send a websocket frame.
     void send_frame(opcode op, std::string data) { send_frame(op, std::span{data.data(), data.size()}); }
 
@@ -317,6 +319,7 @@ private:
         conn.send(std::span(reinterpret_cast<const u8*>(&mask), sizeof mask));
     }
 
+private:
     /// Receive a websocket message.
     [[nodiscard]] message recvmsg() {
         if (state != connection_state::open) throw std::runtime_error("Not connected");
