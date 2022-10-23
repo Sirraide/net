@@ -1,4 +1,4 @@
-# net
+# libnet
 C++20 networking library: TCP, SSL, HTTP(S), WebSockets
 
 More documentation forthcoming.
