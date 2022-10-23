@@ -164,7 +164,7 @@ public:
     /// \param data The data to send.
     /// \param size The size of the data to send (in bytes).
     /// \throws std::runtime_error If the send fails.
-    void send(const char* data, size_t size) {
+    void send(const void* data, size_t size) {
         if (not connected) raise("SSL client not connected");
         if (size > std::numeric_limits<int>::max()) raise("SSL client send size too large");
 
@@ -182,9 +182,14 @@ public:
 
     /// Receive more data.
     ///
+    /// If the buffer already contains `bytes` bytes, this function will return immediately.
+    ///
     /// \param buffer The buffer to receive into
-    /// \param bytes The number of bytes to receive.
+    /// \param bytes The number of bytes to receive. A value of `0` means that
+    ///     the implementation will always perform a call to recv() and that
+    ///     it will only call recv() once.
     void recv(recvbuffer& v, size_t bytes = 0) {
+        if (bytes and v.size() >= bytes) return;
         v.allocate(bytes);
         v.grow(recv(v.data(), std::min<u64>(v.capacity(), std::numeric_limits<int>::max()), bytes));
     }
@@ -197,7 +202,7 @@ public:
     ///      until at least this many bytes have been received.
     /// \returns The number of bytes received.
     /// \throws std::runtime_error If the receive fails.
-    u64 recv(u8* data, u64 size, u64 at_least = 1) {
+    u64 recv(void* data, u64 size, u64 at_least = 1) {
         if (not connected) raise("SSL client not connected");
         if (not size or size > std::numeric_limits<int>::max()) raise("SSL client recv() size must be between 1 and {}", std::numeric_limits<int>::max());
 
@@ -205,7 +210,10 @@ public:
         u64 n_read{};
         for (;;) {
             auto ret = BIO_read(bio, data, int(size));
-            if (ret < 0 and not not BIO_should_retry(bio)) raise("OpenSSL: BIO_read() failed");
+            if (ret < 0) {
+                if (not BIO_should_retry(bio)) raise("OpenSSL: BIO_read() failed");
+                continue;
+            }
             n_read += ret;
             if (n_read >= at_least) return n_read;
         }

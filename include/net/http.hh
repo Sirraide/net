@@ -88,7 +88,7 @@ using headers = smap_impl<true>;
 
 /// The body of a request/response may contain 0 bytes, for which reason we
 /// can't store it in a std::string.
-using octets = std::vector<u8>;
+using octets = std::vector<char>;
 
 /// HTTP response.
 struct response {
@@ -321,7 +321,7 @@ name:
 ///
 /// TODO: Make sure this complies with RFC 3986.
 template <bool incremental = true>
-resumable parse_uri(std::span<const u8> input, u64& consumed, url& uri) {
+resumable parse_uri(std::span<const char> input, u64& consumed, url& uri) {
     /// Parse the request/status line.
     std::string parse_buffer1;
     std::string parse_buffer2;
@@ -511,7 +511,7 @@ resumable parse_uri(std::span<const u8> input, u64& consumed, url& uri) {
 /// HTTP headers parser.
 ///
 /// This parses HTTP headers and the final CRLF that terminates them.
-resumable parse_headers(std::span<const u8>& input, u64& consumed, headers& hdrs) {
+resumable parse_headers(std::span<const char>& input, u64& consumed, headers& hdrs) {
     /// Parse the request/status line.
     std::string name;
     const char* data = reinterpret_cast<const char*>(input.data());
@@ -636,7 +636,7 @@ resumable parse_headers(std::span<const u8>& input, u64& consumed, headers& hdrs
 /// \param input The input buffer.
 /// \param consumed How many characters have been consumed from the input buffer.
 /// \param req The output request.
-resumable parse_request(std::span<const u8>& input, u64& consumed, request& req) {
+resumable parse_request(std::span<const char>& input, u64& consumed, request& req) {
     /// Parse the request/status line.
     const char* data = reinterpret_cast<const char*>(input.data());
     const char* end = data + input.size();
@@ -663,7 +663,7 @@ resumable parse_request(std::span<const u8>& input, u64& consumed, request& req)
                 req.proto = 9;
                 accept();
             case 'H': jmp(l_H);
-            default: ERR("Invalid character after URI: {}", data[i]);
+            default: ERR("Invalid character after URI in request: {}", data[i]);
         }
     }
 
@@ -799,7 +799,7 @@ resumable parse_request(std::span<const u8>& input, u64& consumed, request& req)
 /// \param input The input buffer.
 /// \param consumed How many characters have been consumed from the input buffer.
 /// \param res The output response.
-resumable parse_response(std::span<const u8>& input, u64& consumed, response& res) {
+resumable parse_response(std::span<const char>& input, u64& consumed, response& res) {
     /// Parse the request/status line.
     const char* data = reinterpret_cast<const char*>(input.data());
     const char* end = data + input.size();
@@ -823,7 +823,7 @@ resumable parse_response(std::span<const u8>& input, u64& consumed, response& re
                 res.proto = 9;
                 accept();
             case 'H': jmp(l_H);
-            default: ERR("Invalid character after URI: '{}'", data[i]);
+            default: ERR("Invalid character after URI in response: '{}'", data[i]);
         }
     }
 
@@ -981,7 +981,7 @@ url::url(std::string_view sv) {
     /// Parse the url.
     u64 consumed = 0;
     auto parser = detail::parse_uri<false>(
-        std::span<const u8>{reinterpret_cast<const u8*>(sv.data()), sv.size()},
+        {(sv.data()), sv.size()},
         consumed,
         *this
     );
@@ -1021,7 +1021,7 @@ public:
 
         /// TODO: recv in separate thread w/ std::async and std::future to allow for timeouts.
         /// Create a parser.
-        std::span<const u8> span;
+        std::span<const char> span;
         u64 consumed = 0;
         auto parser = detail::parse_response(span, consumed, res);
         for (;;) {

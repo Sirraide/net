@@ -18,19 +18,20 @@
 namespace net::detail {
 
 /// XOR a region of memory with a 32-bit value.
-void memxor32(uint8_t* data, std::size_t size, int mask) {
+void memxor32(void* ptr, std::size_t size, int mask) {
     std::size_t i = 0;
+    auto* data = reinterpret_cast<std::uint8_t*>(ptr);
 
     /// Align the pointer to a 32-bit boundary.
     while (i < size and (reinterpret_cast<uintptr_t>(data) + i) & 3) {
-        data[i] ^= reinterpret_cast<uint8_t*>(&mask)[i % 4];
+        data[i] ^= reinterpret_cast<std::uint8_t*>(&mask)[i % 4];
         i++;
     }
 
     /// Align to a 64-bit boundary.
 #ifdef __MMX__
     if (i < size and (reinterpret_cast<uintptr_t>(data) + i) & 7) {
-        *reinterpret_cast<uint32_t*>(data + i) ^= mask;
+        *reinterpret_cast<std::uint32_t*>(data + i) ^= mask;
         i += 4;
     }
 #endif
@@ -97,13 +98,13 @@ void memxor32(uint8_t* data, std::size_t size, int mask) {
 
     /// XOR 4 bytes at a time.
     while (i + 4 <= size) {
-        *reinterpret_cast<uint32_t*>(data + i) ^= mask;
+        *reinterpret_cast<std::uint32_t*>(data + i) ^= mask;
         i += 4;
     }
 
     /// XOR the remaining bytes.
     while (i < size) {
-        data[i] ^= reinterpret_cast<uint8_t*>(&mask)[i % 4];
+        data[i] ^= reinterpret_cast<std::uint8_t*>(&mask)[i % 4];
         i++;
     }
 }
