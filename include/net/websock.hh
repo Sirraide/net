@@ -342,7 +342,7 @@ private:
             auto& hdr = buffer.extract<frame_header>();
             if (not std::underlying_type_t<opcode>(type)) type = static_cast<opcode>(hdr.opcode);
 
-            /// The payload length may be larger than 126 bytes.
+            /// Determine the payload length.
             u64 len = hdr.len;
             if (len == 126) {
                 conn.recv(buffer, sizeof(u16));
@@ -357,7 +357,7 @@ private:
             /// used.
             buffer.allocate(len + sizeof(u64) + sizeof(u32));
 
-            /// The mask is a 32-bit value.
+            /// XOR the received data with the mask if there is one.
             if (hdr.mask) {
                 i32 mask;
                 conn.recv(buffer, len + sizeof mask);
@@ -368,7 +368,7 @@ private:
             }
 
             /// Check if this is the last frame. We need to save this value because
-            /// deleting the metadata below will invalidate the reference to the header.
+            /// erasing the metadata below will invalidate the reference to the header.
             const bool fin = hdr.fin;
 
             /// Erase the metadata.
