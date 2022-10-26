@@ -81,6 +81,9 @@
 template <typename T, typename U>
 constexpr inline bool is = std::is_same_v<std::remove_cvref_t<T>, std::remove_cvref_t<U>>;
 
+template <typename T, typename U>
+concept returns = is<T, U>;
+
 /// Get the first element of a parameter pack.
 template <typename T, typename... Ts>
 constexpr inline T& car(T&& t, Ts&&...) { return std::forward<T>(t); }

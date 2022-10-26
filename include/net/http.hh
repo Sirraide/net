@@ -262,27 +262,6 @@ inline i8 xtonum(char c) {
 #define L(name) \
 name:
 
-/// Move to next character and jump to a label; if we're at the end of the input, suspend.
-#define jmp(l)                                                      \
-    do {                                                            \
-        i++;                                                        \
-        if (data + i >= end) [[unlikely]] {                         \
-            consumed += i;                                          \
-            do {                                                    \
-                YIELD_INCOMPLETE();                                 \
-                data = reinterpret_cast<const char*>(input.data()); \
-                end = data + input.size();                          \
-            } while (data == end);                                  \
-        }                                                           \
-        goto l;                                                     \
-    } while (0)
-
-#define accept()       \
-    do {               \
-        i++;           \
-        goto l_accept; \
-    } while (0)
-
 /// Return an error.
 #define ERR(...) throw std::runtime_error(fmt::format(__VA_ARGS__))
 
@@ -292,7 +271,8 @@ name:
         fst = xtonum(data[i]);               \
         if (fst < 0) [[unlikely]]            \
             ERR("Invalid percent encoding"); \
-        jmp(return_state);                   \
+        state = return_state;                \
+        break;                               \
     } while (0)
 
 /// Handle the second character in a percent encoding.
@@ -302,691 +282,1184 @@ name:
         if (snd < 0) [[unlikely]]            \
             ERR("Invalid percent encoding"); \
         buf += char(fst * 16 + snd);         \
-        jmp(return_state);                   \
+        state = return_state;                \
+        break;                               \
     } while (0)
 
-/// Delegate to another parser.
-#define DELEGATE(func, ...)                                 \
-    do {                                                    \
-        input = input.subspan(i);                           \
-        auto parse = func(__VA_ARGS__);                     \
-        while (not parse()) YIELD_INCOMPLETE();             \
-        data = reinterpret_cast<const char*>(input.data()); \
-        end = data + input.size();                          \
-    } while (0)
+/// HTTP Message.
+template <typename type>
+concept http_message = requires(type m) { // clang-format off
+   { m.proto } -> returns<u32>;
+   { m.hdrs } -> returns<headers>;
+   { m.body } -> returns<octets>;
+}; // clang-format on
+
+/// States common to all parsers.
+///
+/// The states of different parsers are marked by a mask bit. This allows us to
+/// nest parsers without having to worry about state collisions.
+enum : u32 {
+    request_parser_state = 0,
+    response_parser_state = 0,
+
+    st_done_state = 1,
+
+    /// States for the uri parser.
+    uri_parser_state = 1 << 20,
+
+    /// States for the headers parser.
+    headers_parser_state = 1 << 21,
+
+    /// States for the body parser.
+    body_parser_state = 1 << 22,
+
+    /// States for the chunked encoding parser.
+    chunked_parser_state = body_parser_state | (1 << 23),
+
+    /// This flag indicates a state that the parser would like to process more input
+    /// in, but if there isn't any, then that's fine too.
+    accepts_more_flag = 1u << 31u,
+};
+
+/// State required for parsing an entity.
+template <typename result>
+struct parser_state;
+
+/// Parsing context.
+///
+/// This is used by the URI, request, and response parsers.
+template <typename result, u32 parser_impl(std::span<const char>&, parser_state<result>&, result&, u32), u32 start_state>
+requires std::is_same_v<std::remove_cvref_t<result>, result>
+struct parser {
+    /// The output of the parser.
+    result& output;
+
+    /// The parser’s current state.
+    u32 state = start_state;
+
+    /// Further state required by the parser.
+    parser_state<result> data;
+
+    /// Construct a parser.
+    explicit parser(result& output) : output(output) {}
+
+    /// Step the parser.
+    ///
+    /// \param input The input to parse.
+    /// \return How much of the input was consumed.
+    [[nodiscard]] u64 operator()(std::span<const char> input) {
+        /// The parser is already done. No more input will be consumed.
+        if (state == st_done_state) [[unlikely]]
+            return 0;
+
+        /// The parser would accept more input, but we don't have any to provide, so we're done.
+        if (state & accepts_more_flag and input.empty()) {
+            state = st_done_state;
+            return 0;
+        }
+
+        /// Advance the parser.
+        const char* const start = input.data();
+        state = parser_impl(input, data, output, state);
+        return input.data() - start;
+    }
+
+    /// Check if the parser is done.
+    [[nodiscard]] bool done() const { return state == st_done_state or state & accepts_more_flag; }
+};
+
+/// URI parser state.
+template <>
+struct parser_state<url> {
+    std::string parse_buffer1;
+    std::string parse_buffer2;
+    u64 start{};
+    u8 fst{};
+};
 
 /// URI parser.
 ///
 /// Currently, this can only parse the path, query parameters, and fragment of a URI.
 ///
 /// TODO: Make sure this complies with RFC 3986.
-template <bool incremental = true>
-resumable parse_uri(std::span<const char> input, u64& consumed, url& uri) {
+u32 parse_uri(std::span<const char>& input, parser_state<url>& parser, url& uri, u32 state) {
     /// Parse the request/status line.
-    std::string parse_buffer1;
-    std::string parse_buffer2;
-    const char* data = reinterpret_cast<const char*>(input.data());
-    const char* end = data + input.size();
+    auto& [parse_buffer1, parse_buffer2, start, fst] = parser;
+    const char* data = input.data();
     u64 i = 0;
-    u64 start;
-    u8 fst;
 
-    /// Make sure there is data to parse.
-    while (data == end) {
-        if constexpr (not incremental) ERR("Unexpected end of input");
-        YIELD_INCOMPLETE();
-        data = reinterpret_cast<const char*>(input.data());
-        end = data + input.size();
-    }
+    enum state_t : u32 {
+        st_start = uri_parser_state,
+        st_uri_param_name_init,
+        st_uri_path_percent,
+        st_uri_path_percent_2,
+        st_uri_param_name_percent,
+        st_uri_param_name_percent_2,
+        st_uri_param_val_init,
+        st_uri_param_val_percent,
+        st_uri_param_val_percent_2,
+        st_uri_fragment_init,
+        st_uri_fragment_percent,
+        st_uri_fragment_percent_2,
 
-/// Create a URI and return.
-#define MK_URI(return_state)                                       \
-    do {                                                           \
-        uri.path = std::string_view{data + start, u64(i - start)}; \
-        jmp(return_state);                                         \
-    } while (0)
+        st_uri_path = 1u | uri_parser_state | accepts_more_flag,
+        st_uri_param_name = 2u | uri_parser_state | accepts_more_flag,
+        st_uri_param_val = 3u | uri_parser_state | accepts_more_flag,
+        st_uri_fragment = 4u | uri_parser_state | accepts_more_flag,
+    };
 
-    /// URI parser.
-    L (l_uri_path_init) { start = i; /** fallthrough **/ }
-    L (l_uri_path) {
-        switch (data[i]) {
-            case '?': MK_URI(l_uri_param_name_init);
-            case '%':
-                parse_buffer1.append(data + start, u64(i - start));
-                jmp(l_uri_path_percent);
-            case ' ': MK_URI(l_accept);
-            case '#': MK_URI(l_uri_fragment_init);
-            default:
-                if (not isurichar(data[i]))
-                    ERR("Invalid character in URI: '{}'", data[i]);
+    for (; i < input.size(); i++) {
+        switch (static_cast<state_t>(state)) {
+            /// URI parser.
+            case st_start: {
+                start = i;
                 [[fallthrough]];
-            case '/':
-                if constexpr (incremental) {
-                    jmp(l_uri_path);
-                } else {
-                    i++;
-                    if (data + i >= end) [[unlikely]] {
+            }
+
+            case st_uri_path: {
+                switch (data[i]) {
+                    case '?':
                         uri.path = std::string_view{data + start, u64(i - start)};
-                        goto l_accept;
-                    }
-                    goto l_uri_path;
+                        state = st_uri_param_name_init;
+                        break;
+                    case '%':
+                        parse_buffer1.append(data + start, u64(i - start));
+                        state = st_uri_path_percent;
+                        break;
+                    case ' ':
+                        uri.path = std::string_view{data + start, u64(i - start)};
+                        goto done;
+                    case '#':
+                        uri.path = std::string_view{data + start, u64(i - start)};
+                        state = st_uri_fragment_init;
+                        break;
+                    default:
+                        if (not isurichar(data[i])) ERR("Invalid character in URI: '{}'", data[i]);
+                        [[fallthrough]];
+                    case '/':
+                        state = st_uri_path;
+                        break;
                 }
-        }
-    }
+            } break;
 
-    /// Parse a percent-encoded character in a URI path.
-    L (l_uri_path_percent) { PERC_FST(l_uri_path_percent_2); }
-    L (l_uri_path_percent_2) { PERC_SND(l_uri_path_init, parse_buffer1); }
+            /// Parse a percent-encoded character in a URI path.
+            case st_uri_path_percent: {
+                PERC_FST(st_uri_path_percent_2);
+            } break;
 
-    /// URI param name.
-    L (l_uri_param_name_init) { start = i; /** fallthrough **/ }
-    L (l_uri_param_name) {
-        switch (data[i]) {
-            case '=':
-                parse_buffer1.append(data + start, u64(i - start));
-                jmp(l_uri_param_val_init);
-            case '&':
-                parse_buffer1.append(data + start, u64(i - start));
-                if (not uri.params.has(parse_buffer1)) uri.params[parse_buffer1] = "";
-                parse_buffer1.clear();
-                jmp(l_uri_param_name_init);
-            case '%':
-                parse_buffer1.append(data + start, u64(i - start));
-                jmp(l_uri_param_name_percent);
-            case ' ':
-                parse_buffer1.append(data + start, u64(i - start));
-                if (not uri.params.has(parse_buffer1)) uri.params[parse_buffer1] = "";
-                accept();
-            case '#':
-                parse_buffer1.append(data + start, u64(i - start));
-                if (not uri.params.has(parse_buffer1)) uri.params[parse_buffer1] = "";
-                jmp(l_uri_fragment_init);
-            default:
-                if (not isurichar(data[i])) ERR("Invalid character in URI param name: {}", data[i]);
-                if constexpr (incremental) {
-                    jmp(l_uri_param_name);
-                } else {
-                    i++;
-                    if (data + i >= end) [[unlikely]] {
+            case st_uri_path_percent_2: {
+                PERC_SND(st_start, parse_buffer1);
+            } break;
+
+            /// URI param name.
+            case st_uri_param_name_init: {
+                start = i;
+                [[fallthrough]];
+            }
+
+            case st_uri_param_name: {
+                switch (data[i]) {
+                    case '=':
+                        parse_buffer1.append(data + start, u64(i - start));
+                        state = st_uri_param_val_init;
+                        break;
+                    case '&':
                         parse_buffer1.append(data + start, u64(i - start));
                         if (not uri.params.has(parse_buffer1)) uri.params[parse_buffer1] = "";
-                        goto l_accept;
-                    }
-                    goto l_uri_param_name;
+                        parse_buffer1.clear();
+                        state = st_uri_param_name_init;
+                        break;
+                    case '%':
+                        parse_buffer1.append(data + start, u64(i - start));
+                        state = st_uri_param_name_percent;
+                        break;
+                    case ' ':
+                        parse_buffer1.append(data + start, u64(i - start));
+                        if (not uri.params.has(parse_buffer1)) uri.params[parse_buffer1] = "";
+                        goto done;
+                    case '#':
+                        parse_buffer1.append(data + start, u64(i - start));
+                        if (not uri.params.has(parse_buffer1)) uri.params[parse_buffer1] = "";
+                        state = st_uri_fragment_init;
+                        break;
+                    default:
+                        if (not isurichar(data[i])) ERR("Invalid character in URI param name: {}", data[i]);
+                        state = st_uri_param_name;
+                        break;
                 }
-        }
-    }
+            } break;
 
-    /// Parse a percent-encoded character in a URI param name.
-    L (l_uri_param_name_percent) { PERC_FST(l_uri_param_name_percent_2); }
-    L (l_uri_param_name_percent_2) { PERC_SND(l_uri_param_name_init, parse_buffer1); }
+            /// Parse a percent-encoded character in a URI param name.
+            case st_uri_param_name_percent: {
+                PERC_FST(st_uri_param_name_percent_2);
+            } break;
 
-    /// URI param value.
-    L (l_uri_param_val_init) { start = i; /** fallthrough **/ }
-    L (l_uri_param_val) {
-        switch (data[i]) {
-            case '&':
-                parse_buffer2.append(data + start, u64(i - start));
-                if (not uri.params.has(parse_buffer1)) uri.params[parse_buffer1] = parse_buffer2;
-                parse_buffer1.clear();
-                parse_buffer2.clear();
-                jmp(l_uri_param_name_init);
-            case '%':
-                parse_buffer2.append(data + start, u64(i - start));
-                jmp(l_uri_param_val_percent);
-            case ' ':
-                parse_buffer2.append(data + start, u64(i - start));
-                if (not uri.params.has(parse_buffer1)) uri.params[parse_buffer1] = parse_buffer2;
-                accept();
-            case '#':
-                parse_buffer2.append(data + start, u64(i - start));
-                if (not uri.params.has(parse_buffer1)) uri.params[parse_buffer1] = parse_buffer2;
-                jmp(l_uri_fragment_init);
-            default:
-                if (not isurichar(data[i])) ERR("Invalid character in URI param value: {}", data[i]);
-                if constexpr (incremental) {
-                    jmp(l_uri_param_val);
-                } else {
-                    i++;
-                    if (data + i >= end) [[unlikely]] {
+            case st_uri_param_name_percent_2: {
+                PERC_SND(st_uri_param_name_init, parse_buffer1);
+            } break;
+
+            /// URI param value.
+            case st_uri_param_val_init: {
+                start = i;
+                [[fallthrough]];
+            }
+
+            case st_uri_param_val: {
+                switch (data[i]) {
+                    case '&':
                         parse_buffer2.append(data + start, u64(i - start));
                         if (not uri.params.has(parse_buffer1)) uri.params[parse_buffer1] = parse_buffer2;
-                        goto l_accept;
-                    }
-                    goto l_uri_param_val;
+                        parse_buffer1.clear();
+                        parse_buffer2.clear();
+                        state = st_uri_param_name_init;
+                        break;
+                    case '%':
+                        parse_buffer2.append(data + start, u64(i - start));
+                        state = st_uri_param_val_percent;
+                        break;
+                    case ' ':
+                        parse_buffer2.append(data + start, u64(i - start));
+                        if (not uri.params.has(parse_buffer1)) uri.params[parse_buffer1] = parse_buffer2;
+                        goto done;
+                    case '#':
+                        parse_buffer2.append(data + start, u64(i - start));
+                        if (not uri.params.has(parse_buffer1)) uri.params[parse_buffer1] = parse_buffer2;
+                        state = st_uri_fragment_init;
+                        break;
+                    default:
+                        if (not isurichar(data[i])) ERR("Invalid character in URI param value: {}", data[i]);
+                        state = st_uri_param_val;
+                        break;
                 }
-        }
-    }
+            } break;
 
-    /// Parse a percent-encoded character in a URI param value.
-    L (l_uri_param_val_percent) { PERC_FST(l_uri_param_val_percent_2); }
-    L (l_uri_param_val_percent_2) { PERC_SND(l_uri_param_val_init, parse_buffer2); }
+            /// Parse a percent-encoded character in a URI param value.
+            case st_uri_param_val_percent: {
+                PERC_FST(st_uri_param_val_percent_2);
+            } break;
 
-    /// URI fragment.
-    L (l_uri_fragment_init) {
-        start = i;
-        parse_buffer1.clear(); /** fallthrough **/
-    }
-    L (l_uri_fragment) {
-        switch (data[i]) {
-            case '%':
-                parse_buffer1.append(data + start, i - start);
-                jmp(l_uri_fragment_percent);
-            case ' ':
-                parse_buffer1.append(data + start, i - start);
-                uri.fragment = parse_buffer1;
-                accept(); /** Not uri chars. **/
-            case '?':
-            case '/':
-                jmp(l_uri_fragment);
-            default:
-                if (not isurichar(data[i])) ERR("Invalid character in URI fragment: {}", data[i]);
-                if constexpr (incremental) {
-                    jmp(l_uri_fragment);
-                } else {
-                    i++;
-                    if (data + i >= end) [[unlikely]] {
+            case st_uri_param_val_percent_2: {
+                PERC_SND(st_uri_param_val_init, parse_buffer2);
+            } break;
+
+            /// URI fragment.
+            case st_uri_fragment_init: {
+                start = i;
+                parse_buffer1.clear();
+                [[fallthrough]];
+            }
+
+            case st_uri_fragment: {
+                switch (data[i]) {
+                    case '%':
+                        parse_buffer1.append(data + start, i - start);
+                        state = st_uri_fragment_percent;
+                        break;
+                    case ' ':
                         parse_buffer1.append(data + start, i - start);
                         uri.fragment = parse_buffer1;
-                        goto l_accept;
-                    }
-                    goto l_uri_fragment;
+                        goto done; /** Not uri chars. **/
+                    case '?':
+                    case '/':
+                        state = st_uri_fragment;
+                        break;
+                    default:
+                        if (not isurichar(data[i])) ERR("Invalid character in URI fragment: {}", data[i]);
+                        state = st_uri_fragment;
+                        break;
                 }
+            } break;
+
+            /// Parse a percent-encoded character in a URI fragment.
+            case st_uri_fragment_percent: {
+                PERC_FST(st_uri_fragment_percent_2);
+            }
+            case st_uri_fragment_percent_2: {
+                PERC_SND(st_uri_fragment_init, parse_buffer1);
+            }
         }
     }
 
-    /// Parse a percent-encoded character in a URI fragment.
-    L (l_uri_fragment_percent) { PERC_FST(l_uri_fragment_percent_2); }
-    L (l_uri_fragment_percent_2) { PERC_SND(l_uri_fragment_init, parse_buffer1); }
+    /// Return the current state.
+    L (ret) {
+        /// Append remaining data.
+        switch (state) {
+            case st_uri_path: uri.path.append(data + start, u64(i - start)); break;
+            case st_uri_param_name: parse_buffer1.append(data + start, u64(i - start)); break;
+            case st_uri_param_val: parse_buffer2.append(data + start, u64(i - start)); break;
+            case st_uri_fragment: parse_buffer1.append(data + start, u64(i - start)); break;
+            default: break;
+        }
 
-    /// Done!
-    L (l_accept) {
-        consumed += i;
-        YIELD_SUCCESS();
+        /// Consume parsed data.
+        input = input.subspan(i);
+        return state;
     }
 
-#undef MK_URI
+    /// We're done!
+    L (done) {
+        i++;
+        state = st_done_state;
+        goto ret;
+    }
 }
+
+/// Headers parser state.
+template <>
+struct parser_state<headers> {
+    std::string name;
+    std::string value;
+    u64 start{};
+};
 
 /// HTTP headers parser.
 ///
 /// This parses HTTP headers and the final CRLF that terminates them.
-resumable parse_headers(std::span<const char>& input, u64& consumed, headers& hdrs) {
+u32 parse_headers(std::span<const char>& input, parser_state<headers>& parser, headers& hdrs, u32 state) {
     /// Parse the request/status line.
-    std::string name;
-    const char* data = reinterpret_cast<const char*>(input.data());
-    const char* end = data + input.size();
+    auto& [name, value, start] = parser;
+    const char* data = input.data();
     u64 i = 0;
-    u64 start;
 
-    /// Make sure there is data to parse.
-    while (data == end) {
-        YIELD_INCOMPLETE();
-        data = reinterpret_cast<const char*>(input.data());
-        end = data + input.size();
-    }
+    enum state_t : u32 {
+        st_start = headers_parser_state,
+        st_name,
+        st_colon,
+        st_ws_after_colon,
+        st_value,
+        st_ws_after_value,
+        st_needs_lf,
+        st_needs_final_lf,
+    };
 
     /// Helper to add a header to the request.
     const auto append_header = [&]() {
         std::ranges::transform(name.begin(), name.end(), name.begin(), [](auto c) { return std::tolower(c); });
-        hdrs[name] = std::string_view{data + start, i - start};
+        if (not value.empty()) {
+            value += std::string_view{data + start, i - start};
+            hdrs[name] = value;
+            value.clear();
+        } else {
+            hdrs[name] = std::string_view{data + start, i - start};
+        }
         name.clear();
     };
 
-    /// Actual parser.
-    L (l_start) {
-        start = i;
-        switch (data[i]) {
-            case '\r': jmp(l_needs_final_lf);
-            case '\n': accept();
-            default:
-                if (not istchar(data[i])) ERR("Invalid character in header name: {}", data[i]);
-                jmp(l_name);
-        }
-    }
-
-    /// Header name.
-    L (l_name) {
-        switch (data[i]) {
-            case '\r': jmp(l_needs_lf);
-            case '\n': jmp(l_start);
-            case ':':
-                name.append(data + start, i - start);
-                jmp(l_colon);
-            default:
-                if (not istchar(data[i])) ERR("Invalid character in header name: {}", data[i]);
-                jmp(l_name);
-        }
-    }
-
-    /// Colon and whitespace.
-    L (l_colon) { start = i; /** fallthrough **/ }
-    L (l_ws_after_colon) {
-        switch (data[i]) {
-            case ' ':
-            case '\t': jmp(l_ws_after_colon);
-            default:
-                if (istext(data[i])) {
-                    start = i;
-                    jmp(l_value);
+    for (; i < input.size(); i++) {
+        switch (static_cast<state_t>(state)) {
+            /// Actual parser.
+            case st_start: {
+                start = i;
+                switch (data[i]) {
+                    case '\r': state = st_needs_final_lf; break;
+                    case '\n': goto done;
+                    default:
+                        if (not istchar(data[i])) ERR("Invalid character in header name: {}", data[i]);
+                        state = st_name;
+                        break;
                 }
-                ERR("Invalid character after colon in header: {}", data[i]);
+            } break;
+
+            /// Header name.
+            case st_name: {
+                switch (data[i]) {
+                    case '\r': state = st_needs_lf; break;
+                    case '\n': state = st_start; break;
+                    case ':':
+                        name.append(data + start, i - start);
+                        state = st_colon;
+                        break;
+                    default:
+                        if (not istchar(data[i])) ERR("Invalid character in header name: {}", data[i]);
+                        state = st_name;
+                        break;
+                }
+            } break;
+
+            /// Colon and whitespace.
+            case st_colon: {
+                start = i;
+                [[fallthrough]];
+            }
+            case st_ws_after_colon: {
+                switch (data[i]) {
+                    case ' ':
+                    case '\t': state = st_ws_after_colon; break;
+                    default:
+                        if (istext(data[i])) {
+                            start = i;
+                            state = st_value;
+                            break;
+                        }
+                        ERR("Invalid character after colon in header: {}", data[i]);
+                }
+            } break;
+
+            /// Header value.
+            case st_value: {
+                switch (data[i]) {
+                    case ' ':
+                    case '\t': state = st_ws_after_value; break;
+                    case '\r':
+                        append_header();
+                        state = st_needs_lf;
+                        break;
+                    case '\n':
+                        append_header();
+                        state = st_start;
+                        break;
+                    default:
+                        if (not istext(data[i])) ERR("Invalid character in header value: {}", data[i]);
+                        state = st_value;
+                        break;
+                }
+            } break;
+
+            /// Whitespace after the value.
+            case st_ws_after_value: {
+                switch (data[i]) {
+                    case ' ':
+                    case '\t': state = st_ws_after_value; break;
+                    case '\r':
+                        append_header();
+                        state = st_needs_lf;
+                        break;
+                    case '\n':
+                        append_header();
+                        state = st_start;
+                        break;
+                    default:
+                        if (istext(data[i])) {
+                            state = st_value;
+                            break;
+                        }
+                        ERR("Invalid character in header after value: {}", data[i]);
+                }
+            } break;
+
+            /// LF after header value.
+            case st_needs_lf: {
+                switch (data[i]) {
+                    case '\n': state = st_start; break;
+                    default: ERR("Headers: needs LF, got {}", data[i]);
+                }
+            } break;
+
+            /// Final CRLF after the headers.
+            case st_needs_final_lf: {
+                switch (data[i]) {
+                    case '\n': goto done;
+                    default: ERR("Headers: needs final LF, got {}", data[i]);
+                }
+            } break;
         }
     }
 
-    /// Header value.
-    L (l_value) {
-        switch (data[i]) {
-            case ' ':
-            case '\t': jmp(l_ws_after_value);
-            case '\r':
-                append_header();
-                jmp(l_needs_lf);
-            case '\n':
-                append_header();
-                jmp(l_start);
-            default:
-                if (not istext(data[i])) ERR("Invalid character in header value: {}", data[i]);
-                jmp(l_value);
+    /// Return the currrent state.
+    L (ret) {
+        /// Append remaining data.
+        switch (state) {
+            case st_name: name.append(data + start, i - start); break;
+            case st_value: value.append(data + start, i - start); break;
+            default: break;
         }
-    }
 
-    /// Whitespace after the value.
-    L (l_ws_after_value) {
-        switch (data[i]) {
-            case ' ':
-            case '\t': jmp(l_ws_after_value);
-            case '\r':
-                append_header();
-                jmp(l_needs_lf);
-            case '\n':
-                append_header();
-                jmp(l_start);
-            default:
-                if (istext(data[i])) jmp(l_value);
-                ERR("Invalid character in header after value: {}", data[i]);
-        }
-    }
-
-    /// LF after header value.
-    L (l_needs_lf) {
-        switch (data[i]) {
-            case '\n': jmp(l_start);
-            default: ERR("Headers: needs LF, got {}", data[i]);
-        }
-    }
-
-    /// Final CRLF after the headers.
-    L (l_needs_final_lf) {
-        switch (data[i]) {
-            case '\n': accept();
-            default: ERR("Headers: needs final LF, got {}", data[i]);
-        }
+        /// Consume parsed data.
+        input = input.subspan(i);
+        return state;
     }
 
     /// Done!
-    L (l_accept) {
-        consumed += i;
-        YIELD_SUCCESS();
+    L (done) {
+        i++;
+        state = st_done_state;
+        goto ret;
     }
 }
+
+/// Body parser state.
+template <>
+struct parser_state<octets> {
+    u64 len{};
+    parser_state<headers> hdrs_parser;
+};
+
+/// HTTP request/response body parser.
+///
+/// \param input The input buffer.
+/// \param message The message whose body we're parsing.
+/// \param state The current state.
+u32 parse_body(std::span<const char>& input, parser_state<octets>& parser, http_message auto& msg, u32 state) {
+    auto& [len, hdrs_parser] = parser;
+
+    enum state_t : u32 {
+        st_start = body_parser_state,
+        st_read_body,
+        st_chunk_size = body_parser_state | chunked_parser_state,
+        st_lf_after_chunk_size,
+        st_read_chunk,
+        st_lf_after_last_chunk,
+        st_trailers = body_parser_state | headers_parser_state | chunked_parser_state,
+        st_read_until_conn_close = 1u | body_parser_state | accepts_more_flag,
+    };
+
+    /// Trailers parser.
+    if (state & headers_parser_state) return parse_headers(input, hdrs_parser, msg.hdrs, state);
+
+    /// Actual body parser.
+    u64 i = 0;
+    const char* data = input.data();
+    for (; i < input.size(); i++) {
+        switch (static_cast<state_t>(state)) {
+            case st_start: {
+                /// All 1xx (informational), 204 (no content), and 304 (not modified)
+                /// responses MUST NOT include a message-body.
+                if (msg.proto == 9) return st_done_state;
+                if constexpr (requires { {msg.status} -> returns<u32>; }) {
+                    if (msg.status == 204 or msg.status == 304) return st_done_state;
+                }
+
+                /// If a Transfer-Encoding header field (section 14.41) is present and
+                /// has any value other than "identity", then the transfer-length is
+                /// defined by use of the "chunked" transfer-coding (section 3.6),
+                /// unless the message is terminated by closing the connection.
+                auto t = msg.hdrs["Transfer-Encoding"];
+                if (t and *t != "identity") {
+                    state = st_chunk_size;
+                    break; /// Jump to chunked parser.
+                }
+
+                /// If a Content-Length header field (section 14.13) is present, its
+                /// decimal value in OCTETs represents both the entity-length and the
+                /// transfer-length.
+                ///
+                /// If a message is received with both a Transfer-Encoding header field
+                /// and a Content-Length header field, the latter MUST be ignored.
+                if (auto l = msg.hdrs["Content-Length"]; l and (not t or *t == "identity")) {
+                    len = std::stoull(*l);
+                    goto read_body;
+                }
+
+                /// Otherwise, the end of the message body is indicated by the closing
+                /// of the connection.
+                goto read_until_conn_close;
+            }
+
+            /// Read up to a certain number of bytes from the input.
+            read_body:
+            case st_read_body: {
+                for (;;) {
+                    auto chunk = std::min<u64>(len, input.size());
+                    msg.body.reserve(msg.body.size() + chunk);
+                    msg.body.insert(
+                        msg.body.end(),
+                        input.begin(),
+                        input.begin() + static_cast<std::ptrdiff_t>(chunk)
+                    );
+
+                    /// We've read the entire body.
+                    len -= chunk;
+                    if (len == 0) return st_done_state;
+
+                    /// Need more data.
+                    input = input.subspan(chunk);
+                    return st_read_body;
+                }
+            }
+
+            /// Read the entire input until the connection is closed.
+            read_until_conn_close:
+            case st_read_until_conn_close: {
+                for (;;) {
+                    msg.body.reserve(msg.body.size() + input.size());
+                    msg.body.insert(
+                        msg.body.end(),
+                        input.begin(),
+                        input.end()
+                    );
+
+                    /// Need more data.
+                    input = input.subspan(input.size());
+                    return st_read_until_conn_close;
+                }
+            }
+
+            /// Chunk size.
+            case st_chunk_size: {
+                switch (data[i]) {
+                    case '0' ... '9': len = len * 16 + (data[i] - '0'); break;
+                    case 'a' ... 'f': len = len * 16 + (data[i] - 'a' + 10); break;
+                    case 'A' ... 'F': len = len * 16 + (data[i] - 'A' + 10); break;
+                    case '\r':
+                        state = len == 0 ? st_lf_after_last_chunk : st_lf_after_chunk_size;
+                        break;
+                    default: ERR("Invalid character in chunk size: {}", data[i]);
+                }
+            } break;
+
+            /// LF after chunk size.
+            case st_lf_after_chunk_size: {
+                switch (data[i]) {
+                    case '\n': state = st_read_chunk; break;
+                    default: ERR("Expected LF after chunk size, got {}", data[i]);
+                }
+            } break;
+
+            /// Last chunk.
+            case st_lf_after_last_chunk: {
+                switch (data[i]) {
+                    case '\n': state = st_trailers; break;
+                    default: ERR("Expected LF after last chunk, got {}", data[i]);
+                }
+            } break;
+
+            /// Read chunk.
+            case st_read_chunk: {
+                auto chunk = std::min<u64>(len, input.size() - i);
+                msg.body.reserve(msg.body.size() + chunk);
+                msg.body.insert(
+                    msg.body.end(),
+                    input.begin() + static_cast<std::ptrdiff_t>(i),
+                    input.begin() + static_cast<std::ptrdiff_t>(i + chunk)
+                );
+
+                /// We've read the entire chunk.
+                len -= chunk;
+                if (len == 0) {
+                    state = st_chunk_size;
+                    i += chunk - 1;
+                    break;
+                }
+
+                /// Need more data.
+                input = input.subspan(i + chunk);
+                return st_read_chunk;
+            }
+
+            /// Trailers.
+            case st_trailers: {
+                input = input.subspan(i);
+                return parse_headers(input, hdrs_parser, msg.hdrs, headers_parser_state);
+            }
+        }
+    }
+
+    input = input.subspan(i);
+    return state;
+}
+
+/// Request parser state.
+template <>
+struct parser_state<request> {
+    u64 start{};
+    parser_state<url> url_parser;
+    parser_state<headers> hdrs_parser;
+    parser_state<octets> body_parser;
+};
 
 /// HTTP request parser.
 ///
 /// \param input The input buffer.
-/// \param consumed How many characters have been consumed from the input buffer.
 /// \param req The output request.
-resumable parse_request(std::span<const char>& input, u64& consumed, request& req) {
+/// \param state The current state of the parser.
+u32 parse_request(std::span<const char>& input, parser_state<request>& parser, request& req, u32 state) {
     /// Parse the request/status line.
-    const char* data = reinterpret_cast<const char*>(input.data());
-    const char* end = data + input.size();
+    auto& [start, url_parser, hdrs_parser, body_parser] = parser;
+    const char* data = input.data();
     u64 i = 0;
-    u64 start;
 
-    /// Make sure there is data to parse.
-    while (data == end) {
-        YIELD_INCOMPLETE();
-        data = reinterpret_cast<const char*>(input.data());
-        end = data + input.size();
-    }
+    enum state_t : u32 {
+        st_start = request_parser_state,
+        st_method,
+        st_ws_after_method,
+        st_ws_after_uri,
+        st_H,
+        st_HT,
+        st_HTT,
+        st_HTTP,
+        st_http_ver_maj,
+        st_http_ver_rest,
+        st_http_ver_min,
+        st_ws_after_ver,
+        st_needs_lf,
+        st_body = body_parser_state,
+    };
+
+    /// Nested parsers.
+    if (state & uri_parser_state) [[unlikely]]
+        goto uri_parser;
+    if (state & headers_parser_state) [[unlikely]]
+        goto headers_parser;
+    if (state & body_parser_state) [[unlikely]]
+        return parse_body(input, body_parser, req, state);
 
     /// Parser entry point.
+    for (; i < input.size(); i++) {
+        switch (static_cast<state_t>(state)) {
+            case st_ws_after_uri: {
+                switch (data[i]) {
+                    case ' ': state = st_ws_after_uri; break;
+                    case '\r':
+                        req.proto = 9;
+                        state = st_needs_lf;
+                        break;
+                    case '\n':
+                        /// HTTP/0.9 doesn't have headers.
+                        req.proto = 9;
+                        state = st_body;
+                        break;
+                    case 'H': state = st_H; break;
+                    default: ERR("Invalid character after URI in request: {}", data[i]);
+                }
+            } break;
 
-    L (l_ws_after_uri) {
-        switch (data[i]) {
-            case ' ': jmp(l_ws_after_uri);
-            case '\r':
-                req.proto = 9;
-                jmp(l_needs_lf);
-            case '\n':
-                /// HTTP/0.9 doesn't have headers.
-                req.proto = 9;
-                accept();
-            case 'H': jmp(l_H);
-            default: ERR("Invalid character after URI in request: {}", data[i]);
-        }
-    }
+            /// Parser entry point.
+            case st_start: {
+                start = i;
 
-    /// Parser entry point.
-    L (l_start) {
-        start = i;
+                /// Requests may be preceded by CRLF for some reason...
+                if (data[i] == '\r' or data[i] == '\n') {
+                    state = st_start;
+                    break;
+                }
 
-        /// Requests may be preceded by CRLF for some reason...
-        if (data[i] == '\r' or data[i] == '\n') jmp(l_start);
-        jmp(l_method);
-    }
+                state = st_method;
+                break;
+            }
 
-    /// Parse the method.
-    L (l_method) {
-        /// Whitespace after the method.
-        if (data[i] == ' ') {
-            switch (i - start) {
-                case 3:
-                    if (std::memcmp(data + start, "GET ", 4) == 0) [[likely]] {
-                        req.meth = method::get;
-                        jmp(l_ws_after_method);
+            /// Parse the method.
+            case st_method: {
+                /// Whitespace after the method.
+                if (data[i] == ' ') {
+                    switch (i - start) {
+                        case 3:
+                            if (std::memcmp(data + start, "GET ", 4) == 0) [[likely]] {
+                                req.meth = method::get;
+                                state = st_ws_after_method;
+                                break;
+                            }
+                            ERR("Method not supported");
+                        case 4:
+                            if (std::memcmp(data + start, "HEAD", 4) == 0) {
+                                req.meth = method::head;
+                                state = st_ws_after_method;
+                                break;
+                            } else if (std::memcmp(data + start, "POST", 4) == 0) {
+                                req.meth = method::post;
+                                state = st_ws_after_method;
+                                break;
+                            }
+                            ERR("Method not supported");
+                        default:
+                            ERR("Method not supported");
                     }
-                    ERR("Method not supported");
-                case 4:
-                    if (std::memcmp(data + start, "HEAD", 4) == 0) {
-                        req.meth = method::head;
-                        jmp(l_ws_after_method);
-                    } else if (std::memcmp(data + start, "POST", 4) == 0) {
-                        req.meth = method::post;
-                        jmp(l_ws_after_method);
-                    }
-                    [[fallthrough]];
-                default:
-                    ERR("Method not supported");
+                }
+                if (data[i] < 'A' or data[i] > 'Z') ERR("Invalid character in method name: '{}'", data[i]);
+            } break;
+
+            case st_ws_after_method: {
+                switch (data[i]) {
+                    case ' ': state = st_ws_after_method; break;
+                    case '/': goto uri_parser_init;
+                    default: ERR("Invalid character after method name: '{}'", data[i]);
+                }
+            } break;
+
+            uri_parser_init : {
+                input = input.subspan(i);
+                state = uri_parser_state;
+            }
+
+            uri_parser : {
+                state = parse_uri(input, url_parser, req.uri, state);
+
+                /// URI parser is done.
+                if (state == st_done_state) {
+                    if (input.empty()) return st_ws_after_uri;
+
+                    /// Update our state.
+                    state = st_ws_after_uri;
+                    data = input.data();
+                    i = 0;
+                    break;
+                }
+
+                /// URI parser needs more data.
+                return state;
+            }
+
+            case st_H: {
+                if (data[i] == 'T') {
+                    state = st_HT;
+                    break;
+                }
+                ERR("Expected T after H, got {}", data[i]);
+            }
+
+            case st_HT: {
+                if (data[i] == 'T') {
+                    state = st_HTT;
+                    break;
+                }
+                ERR("Expected T after HT, got {}", data[i]);
+            }
+
+            case st_HTT: {
+                if (data[i] == 'P') {
+                    state = st_HTTP;
+                    break;
+                }
+                ERR("Expected P after HTT, got {}", data[i]);
+            }
+
+            case st_HTTP: {
+                if (data[i] == '/') {
+                    state = st_http_ver_maj;
+                    break;
+                }
+                ERR("Expected / after HTTP, got {}", data[i]);
+            }
+
+            case st_http_ver_maj: {
+                switch (data[i]) {
+                    case '0': state = st_http_ver_maj; break;
+                    case '1': state = st_http_ver_rest; break;
+                    case '2' ... '9': ERR("Unsupported http major version: {}", data[i] - '0');
+                    default: ERR("Expected major version after HTTP/, got {}", data[i]);
+                }
+            } break;
+
+            case st_http_ver_rest: {
+                if (data[i] == '.') {
+                    state = st_http_ver_min;
+                    break;
+                }
+                ERR("Expected . in protocol version, got {}", data[i]);
+            }
+
+            case st_http_ver_min: {
+                switch (data[i]) {
+                    case '0':
+                        req.proto = 10;
+                        state = st_ws_after_ver;
+                        break;
+                    case '1':
+                        req.proto = 11;
+                        state = st_ws_after_ver;
+                        break;
+                    case '\r': state = st_needs_lf; break;
+                    case '\n': i++; goto headers_parser_init;
+                    case ' ': state = st_ws_after_ver; break;
+                    case '2' ... '9': ERR("Unsupported http minor version: {}", data[i] - '0');
+                    default: ERR("Invalid character in protocol version: {}", data[i]);
+                }
+            } break;
+
+            case st_ws_after_ver: {
+                switch (data[i]) {
+                    case ' ': state = st_ws_after_ver; break;
+                    case '\n': i++; goto headers_parser_init;
+                    case '\r': state = st_needs_lf; break;
+                    default: ERR("Invalid character in whitespace after protocol version: {}", data[i]);
+                }
+            } break;
+
+            case st_needs_lf: {
+                if (data[i] == '\n') {
+                    i++;
+                    goto headers_parser_init;
+                }
+                ERR("Expected LF, got {}", data[i]);
+            }
+
+            headers_parser_init : {
+                input = input.subspan(i);
+                state = headers_parser_state;
+            }
+
+            headers_parser : {
+                state = parse_headers(input, hdrs_parser, req.hdrs, state);
+
+                /// Headers parser is done.
+                if (state == st_done_state) {
+                    if (input.empty()) return st_body;
+
+                    /// Update our state.
+                    state = st_body;
+                    data = input.data();
+                    i = 0;
+                    break;
+                }
+
+                /// Headers parser needs more data.
+                return state;
+            }
+
+            case st_body: {
+                /// We don't want to deal w/ parsing HTTP/0.9 bodies.
+                if (req.proto == 9) break;
+
+                /// Parse the body.
+                return parse_body(input, body_parser, req, state);
             }
         }
-        if (data[i] < 'A' or data[i] > 'Z') ERR("Invalid character in method name: '{}'", data[i]);
     }
 
-    L (l_ws_after_method) {
-        switch (data[i]) {
-            case ' ': jmp(l_ws_after_method);
-            case '/': {
-                /// Call the URI parser.
-                DELEGATE(parse_uri, input, i, req.uri);
-                jmp(l_ws_after_uri);
-            }
-            default: ERR("Invalid character after method name: '{}'", data[i]);
-        }
-    }
-
-    L (l_H) {
-        if (data[i] == 'T') jmp(l_HT);
-        ERR("Expected T after H, got {}", data[i]);
-    }
-
-    L (l_HT) {
-        if (data[i] == 'T') jmp(l_HTT);
-        ERR("Expected T after HT, got {}", data[i]);
-    }
-
-    L (l_HTT) {
-        if (data[i] == 'P') jmp(l_HTTP);
-        ERR("Expected P after HTT, got {}", data[i]);
-    }
-
-    L (l_HTTP) {
-        if (data[i] == '/') jmp(l_http_ver_maj);
-        ERR("Expected / after HTTP, got {}", data[i]);
-    }
-
-    L (l_http_ver_maj) {
-        switch (data[i]) {
-            case '0': jmp(l_http_ver_maj);
-            case '1': jmp(l_http_ver_rest);
-            case '2' ... '9': ERR("Unsupported http major version: {}", data[i] - '0');
-            default: ERR("Expected major version after HTTP/, got {}", data[i]);
-        }
-    }
-
-    L (l_http_ver_rest) {
-        if (data[i] == '.') jmp(l_http_ver_min);
-        ERR("Expected . in protocol version, got {}", data[i]);
-    }
-
-    L (l_http_ver_min) {
-        switch (data[i]) {
-            case '0':
-                req.proto = 10;
-                jmp(l_ws_after_ver);
-            case '1':
-                req.proto = 11;
-                jmp(l_ws_after_ver);
-            case '\r': jmp(l_needs_lf);
-            case '\n':
-
-            case ' ': jmp(l_ws_after_ver);
-            case '2' ... '9': ERR("Unsupported http minor version: {}", data[i] - '0');
-            default: ERR("Invalid character in protocol version: {}", data[i]);
-        }
-    }
-
-    L (l_ws_after_ver) {
-        switch (data[i]) {
-            case ' ': jmp(l_ws_after_ver);
-            case '\n':
-                i++;
-                DELEGATE(parse_headers, input, i, req.hdrs);
-                accept();
-            case '\r': jmp(l_needs_lf);
-            default: ERR("Invalid character in whitespace after protocol version: {}", data[i]);
-        }
-    }
-
-    L (l_needs_lf) {
-        if (data[i] == '\n') {
-            i++;
-            DELEGATE(parse_headers, input, i, req.hdrs);
-            accept();
-        }
-        ERR("Expected LF, got {}", data[i]);
-    }
-
-    /// Done!
-    L (l_accept) {
-        consumed += i;
-        YIELD_SUCCESS();
-    }
+    input = input.subspan(i);
+    return state;
 }
+
+/// Request parser state.
+template <>
+struct parser_state<response> {
+    parser_state<headers> hdrs_parser;
+    parser_state<octets> body_parser;
+};
 
 /// HTTP response parser.
 ///
 /// \param input The input buffer.
 /// \param consumed How many characters have been consumed from the input buffer.
 /// \param res The output response.
-resumable parse_response(std::span<const char>& input, u64& consumed, response& res) {
+u32 parse_response(std::span<const char>& input, parser_state<response>& parser, response& res, u32 state) {
     /// Parse the request/status line.
-    const char* data = reinterpret_cast<const char*>(input.data());
-    const char* end = data + input.size();
+    auto& [hdrs_parser, body_parser] = parser;
+    const char* data = input.data();
     u64 i = 0;
 
-    /// Make sure there is data to parse.
-    while (data == end) {
-        YIELD_INCOMPLETE();
-        data = reinterpret_cast<const char*>(input.data());
-        end = data + input.size();
-    }
+    enum state_t : u32 {
+        st_start = response_parser_state,
+        st_needs_lf,
+        st_H,
+        st_HT,
+        st_HTT,
+        st_HTTP,
+        st_http_ver_maj,
+        st_http_ver_rest,
+        st_http_ver_min,
+        st_ws_after_ver,
+        st_status_2nd,
+        st_status_3rd,
+        st_first_ws_after_status,
+        st_ws_after_status,
+        st_reason_phrase,
+        st_body = body_parser_state,
+    };
 
-    L (l_ws_after_uri) {
-        switch (data[i]) {
-            case ' ': jmp(l_ws_after_uri);
-            case '\r':
-                res.proto = 9;
-                jmp(l_needs_lf);
-            case '\n':
-                /// HTTP/0.9 doesn't have headers.
-                res.proto = 9;
-                accept();
-            case 'H': jmp(l_H);
-            default: ERR("Invalid character after URI in response: '{}'", data[i]);
-        }
-    }
+    /// Nested parsers.
+    if (state & headers_parser_state) [[unlikely]]
+        goto headers_parser;
+    if (state & body_parser_state) [[unlikely]]
+        return parse_body(input, body_parser, res, state);
 
-    /// Parser entry point.
-    L (l_start) {
-        if (data[i] == 'H') jmp(l_H);
-        ERR("Expected HTTP version in status line");
-    }
-
-    L (l_H) {
-        if (data[i] == 'T') jmp(l_HT);
-        ERR("Expected T after H, got {}", data[i]);
-    }
-
-    L (l_HT) {
-        if (data[i] == 'T') jmp(l_HTT);
-        ERR("Expected T after HT, got {}", data[i]);
-    }
-
-    L (l_HTT) {
-        if (data[i] == 'P') jmp(l_HTTP);
-        ERR("Expected P after HTT, got {}", data[i]);
-    }
-
-    L (l_HTTP) {
-        if (data[i] == '/') jmp(l_http_ver_maj);
-        ERR("Expected / after HTTP, got {}", data[i]);
-    }
-
-    L (l_http_ver_maj) {
-        switch (data[i]) {
-            case '0': jmp(l_http_ver_maj);
-            case '1': jmp(l_http_ver_rest);
-            case '2' ... '9': ERR("Unsupported http major version: {}", data[i] - '0');
-            default: ERR("Expected major version after HTTP/, got {}", data[i]);
-        }
-    }
-
-    L (l_http_ver_rest) {
-        if (data[i] == '.') jmp(l_http_ver_min);
-        ERR("Expected . in protocol version, got {}", data[i]);
-    }
-
-    L (l_http_ver_min) {
-        switch (data[i]) {
-            case '0':
-                res.proto = 10;
-                jmp(l_ws_after_ver);
-            case '1':
-                res.proto = 11;
-                jmp(l_ws_after_ver);
-            case '\r': jmp(l_needs_lf);
-            case '\n':
-                i++;
-                DELEGATE(parse_headers, input, i, res.hdrs);
-                accept();
-            case ' ': jmp(l_ws_after_ver);
-            case '2' ... '9': ERR("Unsupported http minor version: {}", data[i] - '0');
-            default: ERR("Invalid character in protocol version: {}", data[i]);
-        }
-    }
-
-    L (l_ws_after_ver) {
-        switch (data[i]) {
-            case ' ': jmp(l_ws_after_ver);
-            default:
-                if (std::isdigit(data[i])) {
-                    res.status = (data[i] - '0') * 100;
-                    jmp(l_status_2nd);
+    for (; i < input.size(); i++) {
+        switch (static_cast<state_t>(state)) {
+            /// Parser entry point.
+            case st_start: {
+                if (data[i] == 'H') {
+                    state = st_H;
+                    break;
                 }
-                ERR("Invalid character in whitespace after protocol version: {}", data[i]);
-        }
-    }
-
-    L (l_status_2nd) {
-        if (std::isdigit(data[i])) {
-            res.status += (data[i] - '0') * 10;
-            jmp(l_status_3rd);
-        }
-        ERR("Status code may only contain digits");
-    }
-
-    L (l_status_3rd) {
-        if (std::isdigit(data[i])) {
-            res.status += (data[i] - '0');
-            jmp(l_first_ws_after_status);
-        }
-        ERR("Status code may only contain digits");
-    }
-
-    L (l_first_ws_after_status) {
-        switch (data[i]) {
-            case ' ': jmp(l_ws_after_status);
-            case '\r': jmp(l_needs_lf);
-            case '\n':
-                i++;
-                DELEGATE(parse_headers, input, i, res.hdrs);
-                accept();
-            default: ERR("Invalid character after status code: {}", data[i]);
-        }
-    }
-
-    L (l_ws_after_status) {
-        switch (data[i]) {
-            case ' ': jmp(l_ws_after_status);
-            case '\r': jmp(l_needs_lf);
-            case '\n':
-                i++;
-                DELEGATE(parse_headers, input, i, res.hdrs);
-                accept();
-            default: goto l_reason_phrase; /// (!)
-        }
-    }
-
-    L (l_reason_phrase) {
-        if (not istext(data[i])) {
-            if (data[i] == '\r') jmp(l_needs_lf);
-            if (data[i] == '\n') {
-                i++;
-                DELEGATE(parse_headers, input, i, res.hdrs);
-                accept();
+                ERR("Expected HTTP version in status line");
             }
-            ERR("Reason phrase contains invalid character: '{}'", data[i]);
+
+            case st_H: {
+                if (data[i] == 'T') {
+                    state = st_HT;
+                    break;
+                }
+                ERR("Expected T after H, got {}", data[i]);
+            }
+
+            case st_HT: {
+                if (data[i] == 'T') {
+                    state = st_HTT;
+                    break;
+                }
+                ERR("Expected T after HT, got {}", data[i]);
+            }
+
+            case st_HTT: {
+                if (data[i] == 'P') {
+                    state = st_HTTP;
+                    break;
+                }
+                ERR("Expected P after HTT, got {}", data[i]);
+            }
+
+            case st_HTTP: {
+                if (data[i] == '/') {
+                    state = st_http_ver_maj;
+                    break;
+                }
+                ERR("Expected / after HTTP, got {}", data[i]);
+            }
+
+            case st_http_ver_maj: {
+                switch (data[i]) {
+                    case '0': state = st_http_ver_maj; break;
+                    case '1': state = st_http_ver_rest; break;
+                    case '2' ... '9': ERR("Unsupported http major version: {}", data[i] - '0');
+                    default: ERR("Expected major version after HTTP/, got {}", data[i]);
+                }
+            } break;
+
+            case st_http_ver_rest: {
+                if (data[i] == '.') {
+                    state = st_http_ver_min;
+                    break;
+                }
+                ERR("Expected . in protocol version, got {}", data[i]);
+            }
+
+            case st_http_ver_min: {
+                switch (data[i]) {
+                    case '0':
+                        res.proto = 10;
+                        state = st_ws_after_ver;
+                        break;
+                    case '1':
+                        res.proto = 11;
+                        state = st_ws_after_ver;
+                        break;
+                    case '\r': state = st_needs_lf; break;
+                    case '\n': i++; goto headers_parser_init;
+                    case ' ': state = st_ws_after_ver; break;
+                    case '2' ... '9': ERR("Unsupported http minor version: {}", data[i] - '0');
+                    default: ERR("Invalid character in protocol version: {}", data[i]);
+                }
+            } break;
+
+            headers_parser_init : {
+                input = input.subspan(i);
+                state = headers_parser_state;
+            }
+
+            headers_parser : {
+                state = parse_headers(input, hdrs_parser, res.hdrs, state);
+
+                /// Headers parser is done.
+                if (state == st_done_state) {
+                    if (input.empty()) return st_body;
+
+                    /// Update our state.
+                    state = st_body;
+                    data = input.data();
+                    i = 0;
+                    break;
+                }
+
+                /// Headers parser needs more data.
+                return state;
+            }
+
+            case st_ws_after_ver: {
+                switch (data[i]) {
+                    case ' ': state = st_ws_after_ver; break;
+                    default:
+                        if (std::isdigit(data[i])) {
+                            res.status = (data[i] - '0') * 100;
+                            state = st_status_2nd;
+                            break;
+                        }
+                        ERR("Invalid character in whitespace after protocol version: {}", data[i]);
+                }
+            } break;
+
+            case st_status_2nd: {
+                if (std::isdigit(data[i])) {
+                    res.status += (data[i] - '0') * 10;
+                    state = st_status_3rd;
+                    break;
+                }
+                ERR("Status code may only contain digits");
+            }
+
+            case st_status_3rd: {
+                if (std::isdigit(data[i])) {
+                    res.status += (data[i] - '0');
+                    state = st_first_ws_after_status;
+                    break;
+                }
+                ERR("Status code may only contain digits");
+            }
+
+            case st_first_ws_after_status: {
+                switch (data[i]) {
+                    case ' ': state = st_ws_after_status; break;
+                    case '\r': state = st_needs_lf; break;
+                    case '\n': i++; goto headers_parser_init;
+                    default: ERR("Invalid character after status code: {}", data[i]);
+                }
+            } break;
+
+            case st_ws_after_status: {
+                switch (data[i]) {
+                    case ' ': state = st_ws_after_status; break;
+                    case '\r': state = st_needs_lf; break;
+                    case '\n': i++; goto headers_parser_init;
+                    default: goto reason_phrase; /// (!)
+                }
+            } break;
+
+            case st_reason_phrase: {
+            reason_phrase:
+                if (not istext(data[i])) {
+                    if (data[i] == '\r') {
+                        state = st_needs_lf;
+                        break;
+                    }
+
+                    else if (data[i] == '\n') {
+                        i++;
+                        goto headers_parser_init;
+                    }
+
+                    ERR("Reason phrase contains invalid character: '{}'", data[i]);
+                }
+                state = st_reason_phrase;
+                break;
+            }
+
+            case st_needs_lf: {
+                if (data[i] == '\n') {
+                    i++;
+                    goto headers_parser_init;
+                }
+                ERR("Expected LF, got {}", data[i]);
+            }
+
+            /// Parse the response body.
+            case st_body: {
+                /// We don't want to deal w/ parsing HTTP/0.9 bodies.
+                if (res.proto == 9) break;
+
+                /// Parse the body.
+                return parse_body(input, body_parser, res, state);
+            }
         }
-        jmp(l_reason_phrase);
     }
 
-    L (l_needs_lf) {
-        if (data[i] == '\n') {
-            i++;
-            DELEGATE(parse_headers, input, i, res.hdrs);
-            accept();
-        }
-        ERR("Expected LF, got {}", data[i]);
-    }
-
-    /// Done!
-    L (l_accept) {
-        consumed += i;
-        YIELD_SUCCESS();
-    }
+    /// Return the current state.
+    input = input.subspan(i);
+    return state;
 }
 
-#undef L
-#undef jmp
+using uri_parser = parser<url, parse_uri, uri_parser_state>;
+using headers_parser = parser<headers, parse_headers, headers_parser_state>;
+using request_parser = parser<request, parse_request, request_parser_state>;
+using response_parser = parser<response, parse_response, response_parser_state>;
+
 #undef ERR
-#undef accept
 #undef PERC_FST
 #undef PERC_SND
-#undef DELEGATE
 } // namespace detail
 
 /// Parse a url.
 url::url(std::string_view sv) {
     /// Parse the url.
-    u64 consumed = 0;
-    auto parser = detail::parse_uri<false>(
-        {(sv.data()), sv.size()},
-        consumed,
-        *this
-    );
-    if (not parser() or consumed != sv.size())
-        throw std::runtime_error("Not a valid URL");
+    detail::uri_parser parser{*this};
+    if (parser(sv) != sv.size() or not parser.done()) throw std::runtime_error("Not a valid URL");
 }
 
 template <typename backend_t = tcp::client, u16 default_port = 80>
@@ -1021,9 +1494,7 @@ public:
 
         /// TODO: recv in separate thread w/ std::async and std::future to allow for timeouts.
         /// Create a parser.
-        std::span<const char> span;
-        u64 consumed = 0;
-        auto parser = detail::parse_response(span, consumed, res);
+        auto parser = detail::response_parser{res};
         for (;;) {
             /// Allocate space in the buffer.
             static constexpr u64 increment = 1024;
@@ -1031,21 +1502,17 @@ public:
 
             /// Receive data.
             conn.recv(buffer);
-            if (buffer.empty()) throw std::runtime_error("Connection closed by peer");
-
-            /// Update the span.
-            span = buffer.span();
 
             /// Advance the parser.
-            auto done = parser();
+            auto consumed = parser(buffer);
             buffer.skip(consumed);
 
             /// Stop if we're done.
-            if (done) break;
+            if (parser.done()) break;
 
             /// Check if the timeout has been reached.
-            if (us_timeout > 0us and chrono::high_resolution_clock::now() - now > us_timeout)
-                throw std::runtime_error("Timeout reached");
+            /*if (us_timeout > 0us and chrono::high_resolution_clock::now() - now > us_timeout)
+                throw std::runtime_error("Timeout reached");*/
         }
 
         /// Done!

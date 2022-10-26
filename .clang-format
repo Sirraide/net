@@ -37,6 +37,7 @@ IndentCaseLabels: true
 IndentPPDirectives: AfterHash
 IndentWidth: 4
 IndentWrappedFunctionNames: false
+IndentRequiresClause: false
 JavaScriptQuotes: Single
 KeepEmptyLinesAtTheStartOfBlocks: false
 Language: Cpp

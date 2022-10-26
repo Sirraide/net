@@ -13,12 +13,13 @@ namespace ssl = net::ssl;
 using net::http::octets;
 
 void httpclient() {
-    http::client client{"localhost", 8080};
-    auto res = client.get("/test.html").expect(200);
-    fmt::print("Response headers:\n");
+    https::client client{"www.nguh.org", 443};
+    auto res = client.get("/speedrun").expect(200);
+    fmt::print("RESPONSE:\n");
     for (const auto &[k, v] : res.hdrs.values) {
-        fmt::print("    {}: {}\n", k, v);
+        fmt::print("{}: {}\n", k, v);
     }
+    fmt::print("\nBODY:\n{}\n", std::string_view{res.body});
 }
 
 void websocket() {
@@ -36,5 +37,5 @@ void websocket() {
 }
 
 int main() {
-    websocket();
+    httpclient();
 }

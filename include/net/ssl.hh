@@ -190,7 +190,7 @@ public:
     ///     it will only call recv() once.
     void recv(recvbuffer& v, size_t bytes = 0) {
         if (bytes and v.size() >= bytes) return;
-        v.allocate(bytes);
+        v.allocate(bytes ?: 4096);
         v.grow(recv(v.data(), std::min<u64>(v.capacity(), std::numeric_limits<int>::max()), bytes));
     }
 
@@ -204,7 +204,7 @@ public:
     /// \throws std::runtime_error If the receive fails.
     u64 recv(void* data, u64 size, u64 at_least = 1) {
         if (not connected) raise("SSL client not connected");
-        if (not size or size > std::numeric_limits<int>::max()) raise("SSL client recv() size must be between 1 and {}", std::numeric_limits<int>::max());
+        if (not size or size > std::numeric_limits<int>::max()) raise("SSL client recv() size must be between 1 and {}, but was {}", std::numeric_limits<int>::max(), size);
 
         /// Receive data.
         u64 n_read{};

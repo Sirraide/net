@@ -71,10 +71,10 @@ public:
     ///
     /// \param size The number of additional bytes to allocate.
     void allocate(u64 size) {
-        if (size > cap) {
-            bytes = (char*) std::realloc(bytes, size);
+        if (size > capacity()) {
+            cap = std::max(cap * 2, size);
+            bytes = (char*) std::realloc(bytes, cap);
             if (not bytes) throw std::bad_alloc();
-            cap = size;
         }
      }
 

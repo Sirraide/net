@@ -112,7 +112,7 @@ public:
     ///     it will only call recv() once.
     void recv(recvbuffer& v, size_t bytes = 0) {
         if (bytes and v.size() >= bytes) return;
-        v.allocate(bytes);
+        v.allocate(bytes ?: 4096);
         v.grow(recv(v.data(), v.capacity(), bytes));
     }
 
