@@ -292,7 +292,6 @@ struct require_operator_lhs {
     void operator%(bool rhs) { ASSERT(rhs); }
 };
 static inline require_operator_lhs require_operator_lhs_instance;
-
 #define require require_operator_lhs_instance %
 
 /// Encode a URL.
@@ -311,120 +310,6 @@ inline std::string encode_uri(std::string_view raw) {
     }
     return encoded;
 }
-
-template <std::movable value_t>
-struct generator {
-    static_assert(!std::is_void_v<value_t>, "generator: template parameter must not be void");
-    struct promise_type;
-
-    /// Actual type of the generated values.
-    using value_type = std::remove_cvref_t<value_t>;
-
-    /// Reference/pointer to the value type.
-    using reference = std::add_lvalue_reference_t<value_type>;
-    using pointer = std::add_pointer_t<value_type>;
-
-    /// Coroutine handle type.
-    using handle_type = std::coroutine_handle<promise_type>;
-
-    /// Coroutine promise type.
-    struct promise_type {
-        /// Value.
-        value_type current_value;
-        promise_type() = default;
-
-        /// API.
-        generator get_return_object() { return {handle_type::from_promise(*this)}; }
-        std::suspend_always initial_suspend() { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
-
-        /// Disallow co_await.
-        void await_transform() = delete;
-
-        /// Rethrow exceptions.
-        void unhandled_exception() { throw; }
-
-        /// co_yield.
-        std::suspend_always yield_value(std::convertible_to<value_type> auto&& res) {
-            current_value = std::forward<decltype(res)>(res);
-            return {};
-        }
-
-        /// co_return.
-        void return_void() noexcept {}
-    };
-
-    /// Iterator to support range-based for loops.
-    struct iterator {
-        handle_type handle;
-
-        iterator() : handle(nullptr) {}
-        iterator(handle_type h) : handle(h) {}
-
-        reference operator*() { return handle.promise().current_value; }
-        pointer operator->() { return &handle.promise().current_value; }
-
-        iterator& operator++() {
-            handle.resume();
-            return *this;
-        }
-
-        bool operator==(std::default_sentinel_t) {
-            return !handle || handle.done();
-        }
-    };
-
-private:
-    /// Coroutine handle.
-    handle_type handle;
-
-public:
-    /// Set the handle.
-    generator(handle_type h) : handle(h) {}
-
-    /// Copying coroutines is nonsense.
-    generator(const generator&) = delete;
-    generator& operator=(const generator&) = delete;
-
-    /// Moving is ok.
-    generator(generator&& other) noexcept : handle(other.handle) { other.handle = nullptr; }
-    generator& operator=(generator&& other) noexcept {
-        if (handle) handle.destroy();
-        handle = other.handle;
-        other.handle = nullptr;
-    }
-
-    /// Cleanup.
-    ~generator() {
-        if (handle) handle.destroy();
-    }
-
-    /// Advance the coroutine and return the current value.
-    /// Be careful when using this since there's no way to check if the coroutine is done.
-    reference operator()() {
-        handle.resume();
-        return handle.promise().current_value;
-    }
-
-    iterator begin() {
-        handle.resume();
-        return {handle};
-    }
-    std::default_sentinel_t end() { return {}; }
-};
-
-using resumable = generator<bool>;
-
-#define YIELD_INCOMPLETE() \
-    do {                   \
-        co_yield false;    \
-    } while (0)
-
-#define YIELD_SUCCESS() \
-    do {                \
-        co_yield true;  \
-        co_return;      \
-    } while (0)
 
 /// Convert a string to lowercase.
 inline std::string tolower(std::string_view str) {

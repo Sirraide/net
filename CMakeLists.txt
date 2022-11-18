@@ -21,15 +21,16 @@ add_custom_target (
 )
 
 ## Other Targets
-
-file(GLOB CLI  src/client.cc)
-file(GLOB SRV  src/server.cc)
-file(GLOB TEST test/*.cc)
-
 set(ENABLE_WEBSOCKETS ON)
+
+file(GLOB CLI  test/client.cc)
+file(GLOB SRV  test/server.cc)
+file(GLOB TEST test/http.cc)
+file(GLOB NET  src/*.cc)
 
 add_subdirectory(libs/fmt)
 add_subdirectory(libs/curl)
+add_library(net STATIC ${NET})
 add_executable(client ${CLI})
 add_executable(server ${SRV})
 add_executable(tests  ${TEST})
@@ -38,7 +39,6 @@ add_executable(tests  ${TEST})
 ## Compile options
 ##
 
-add_library(net INTERFACE)
 add_library(options INTERFACE)
 target_compile_options(options INTERFACE
         -Wall -Wextra -Wundef -Werror=return-type
@@ -56,13 +56,19 @@ endif ()
 target_include_directories(options INTERFACE include libs/fmt/include libs/json/include libs/curl/include)
 
 add_dependencies(options openssl)
-target_link_libraries(net INTERFACE
+
+##
+## Libraries
+##
+
+target_link_libraries(net PUBLIC
 	fmt
 	libcurl
 	${PROJECT_SOURCE_DIR}/libs/libcrypto.so
 	${PROJECT_SOURCE_DIR}/libs/libssl.so
 )
 
-target_link_libraries(client PRIVATE options net fmt libcurl)
-target_link_libraries(server PRIVATE options net fmt libcurl)
-target_link_libraries(tests  PRIVATE options net fmt libcurl)
+target_link_libraries(net    PRIVATE options)
+target_link_libraries(client PRIVATE options net)
+target_link_libraries(server PRIVATE options net)
+target_link_libraries(tests  PRIVATE options net)
