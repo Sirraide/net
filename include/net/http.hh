@@ -1539,7 +1539,6 @@ public:
         auto res = response{};
         [[maybe_unused]] auto now = chrono::high_resolution_clock::now();
 
-        /// TODO: recv in separate thread w/ std::async and std::future to allow for timeouts.
         /// Create a parser.
         auto parser = detail::response_parser{res};
         try {
@@ -1560,15 +1559,13 @@ public:
                 if (parser.done()) break;
 
                 /// Check if the timeout has been reached.
-                //if (us_timeout > 0us and chrono::high_resolution_clock::now() - now > us_timeout)
-                  //  throw std::runtime_error("Timeout reached");
+                if (us_timeout > 0us and chrono::high_resolution_clock::now() - now > us_timeout)
+                    throw std::runtime_error("Timeout reached");
             }
         } catch (const timed_out&) {
             if (not parser.done()) throw std::runtime_error("Timeout reached");
         }
 
-        /*fmt::print("{}", buffer.str());
-        exit(42);*/
         /// Done!
         buffer.erase_to_offset();
         return res;
