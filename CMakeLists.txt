@@ -38,6 +38,7 @@ add_executable(tests  ${TEST})
 ## Compile options
 ##
 
+add_library(net INTERFACE)
 add_library(options INTERFACE)
 target_compile_options(options INTERFACE
         -Wall -Wextra -Wundef -Werror=return-type
@@ -55,13 +56,13 @@ endif ()
 target_include_directories(options INTERFACE include libs/fmt/include libs/json/include libs/curl/include)
 
 add_dependencies(options openssl)
-target_link_libraries(options INTERFACE
+target_link_libraries(net INTERFACE
 	fmt
 	libcurl
 	${PROJECT_SOURCE_DIR}/libs/libcrypto.so
 	${PROJECT_SOURCE_DIR}/libs/libssl.so
 )
 
-target_link_libraries(client PRIVATE options fmt libcurl)
-target_link_libraries(server PRIVATE options fmt libcurl)
-target_link_libraries(tests  PRIVATE options fmt libcurl)
+target_link_libraries(client PRIVATE options net fmt libcurl)
+target_link_libraries(server PRIVATE options net fmt libcurl)
+target_link_libraries(tests  PRIVATE options net fmt libcurl)
