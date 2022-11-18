@@ -13,8 +13,7 @@ namespace ssl = net::ssl;
 using net::http::octets;
 
 void httpclient() {
-    https::client client{"www.google.com"};
-    auto res = client.get("/").expect(200);
+    auto res = https::get("https://www.google.com/").expect(200);
     fmt::print("RESPONSE:\n");
     for (const auto &[k, v] : res.hdrs.values) {
         fmt::print("{}: {}\n", k, v);

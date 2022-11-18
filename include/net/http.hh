@@ -91,6 +91,8 @@ using headers = smap_impl<true>;
 using octets = std::vector<char>;
 
 struct url {
+    std::string scheme;
+    std::string userinfo;
     std::string host;
     std::string path;
     std::string fragment;
