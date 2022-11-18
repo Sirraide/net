@@ -221,38 +221,51 @@ public:
         state = connection_state::open;
         if (on_ready) on_ready();
 
+        /// Make sure we don’t loop indefinitely if the server times out.
+        std::chrono::time_point<std::chrono::steady_clock> last_msg = std::chrono::steady_clock::now();
+        auto timeout = 5s;
+
         /// Run the read loop.
         while (state == connection_state::open) {
-            /// Read a message.
-            auto m = recvmsg();
+            try {
+                /// Read a message.
+                auto m = recvmsg();
+                fmt::print(stderr, "Received message: {}\n", u64(m.type));
 
-            /// Dispatch the message.
-            switch (m.type) {
-                case opcode::text:
-                    /// Text message.
-                    if (on_text) on_text(std::move(m));
-                    break;
-                case opcode::binary:
-                    /// Binary message.
-                    if (on_binary) on_binary(std::move(m));
-                    break;
-                case opcode::close:
-                    /// Close message.
-                    if (on_close) on_close(std::move(m));
-                    close();
-                    break;
-                case opcode::ping:
-                    /// Ping message.
-                    if (on_ping) on_ping(std::move(m));
-                    break;
-                case opcode::pong:
-                    /// Pong message.
-                    if (on_pong) on_pong(std::move(m));
-                    break;
-                default:
-                    /// Unknown opcode.
-                    if (on_unknown) on_unknown(std::move(m));
-                    break;
+                /// Dispatch the message.
+                switch (m.type) {
+                    case opcode::text:
+                        /// Text message.
+                        if (on_text) on_text(std::move(m));
+                        break;
+                    case opcode::binary:
+                        /// Binary message.
+                        if (on_binary) on_binary(std::move(m));
+                        break;
+                    case opcode::close:
+                        /// Close message.
+                        if (on_close) on_close(std::move(m));
+                        close();
+                        break;
+                    case opcode::ping:
+                        /// Ping message.
+                        if (on_ping) on_ping(std::move(m));
+                        break;
+                    case opcode::pong:
+                        /// Pong message.
+                        if (on_pong) on_pong(std::move(m));
+                        break;
+                    default:
+                        /// Unknown opcode.
+                        if (on_unknown) on_unknown(std::move(m));
+                        break;
+                }
+
+                /// Update the last message time.
+                last_msg = std::chrono::steady_clock::now();
+            } catch (const timed_out&) {
+                /// Check if we've timed out.
+                if (std::chrono::steady_clock::now() - last_msg > timeout) throw;
             }
         }
     }
