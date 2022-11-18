@@ -13,12 +13,12 @@
 #include <fmt/format.h>
 #include <iterator>
 #include <random>
+#include <span>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <type_traits>
 #include <unistd.h>
 #include <vector>
-#include <span>
 
 #define CAT_(X, Y) X##Y
 #define CAT(X, Y)  CAT_(X, Y)
@@ -377,8 +377,8 @@ struct generator {
 private:
     /// Coroutine handle.
     handle_type handle;
-public:
 
+public:
     /// Set the handle.
     generator(handle_type h) : handle(h) {}
 
@@ -406,7 +406,10 @@ public:
         return handle.promise().current_value;
     }
 
-    iterator begin() { handle.resume(); return {handle}; }
+    iterator begin() {
+        handle.resume();
+        return {handle};
+    }
     std::default_sentinel_t end() { return {}; }
 };
 
@@ -431,25 +434,31 @@ inline std::string tolower(std::string_view str) {
     return res;
 }
 
+struct timed_out : std::runtime_error {
+    template <typename... arguments>
+    explicit timed_out(fmt::format_string<arguments...> fmt = "", arguments&&... args)
+        : std::runtime_error(fmt::format(fmt, std::forward<arguments>(args)...)) {}
+};
+
 /// Enum arithmetic.
 #define ENUM_OPERATOR(op)                                                                                    \
     template <typename enumeration, typename integer>                                                        \
-        requires(std::is_enum_v<enumeration> && std::is_integral_v<integer>)                                 \
+    requires(std::is_enum_v<enumeration> && std::is_integral_v<integer>)                                     \
     constexpr integer operator op(enumeration lhs, integer rhs) { return static_cast<integer>(lhs) op rhs; } \
                                                                                                              \
     template <typename integer, typename enumeration>                                                        \
-        requires(std::is_enum_v<enumeration> && std::is_integral_v<integer>)                                 \
+    requires(std::is_enum_v<enumeration> && std::is_integral_v<integer>)                                     \
     constexpr integer operator op(integer lhs, enumeration rhs) { return lhs op static_cast<integer>(rhs); } \
                                                                                                              \
     template <typename enum1, typename enum2>                                                                \
-        requires(std::is_enum_v<enum1> && std::is_same_v<enum1, enum2>)                                      \
+    requires(std::is_enum_v<enum1> && std::is_same_v<enum1, enum2>)                                          \
     constexpr std::underlying_type_t<enum1> operator op(enum1 lhs, enum2 rhs) {                              \
         using integer = std::underlying_type_t<enum1>;                                                       \
         return static_cast<integer>(lhs) op static_cast<integer>(rhs);                                       \
     }
 
 template <typename enumeration>
-    requires std::is_enum_v<enumeration>
+requires std::is_enum_v<enumeration>
 constexpr std::underlying_type_t<enumeration> operator~(enumeration e) {
     return compl static_cast<std::underlying_type_t<enumeration>>(e);
 }

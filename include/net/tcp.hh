@@ -12,6 +12,8 @@
 #include <thread>
 
 namespace net::tcp {
+using namespace std::chrono_literals;
+
 namespace detail {
 /// Data and functions that are common to both client and server.
 class tcp_base {
@@ -110,7 +112,7 @@ public:
     /// \param bytes The number of bytes to receive. A value of `0` means that
     ///     the implementation will always perform a call to recv() and that
     ///     it will only call recv() once.
-    void recv(recvbuffer& v, size_t bytes = 0) {
+    void recv(recvbuffer& v, size_t bytes = 0, std::chrono::milliseconds timeout = 1s) {
         if (bytes and v.size() >= bytes) return;
         v.allocate(bytes ?: 4096);
         v.grow(recv(v.data(), v.capacity(), bytes));
@@ -122,21 +124,28 @@ public:
     /// \param size The size of the buffer (in bytes).
     /// \param at_least The number of bytes to receive. This function will loop
     ///      until at least this many bytes have been received.
+    /// \param timeout The timeout for the recv() call.
+    ///
     /// \returns The number of bytes received.
+    ///
     /// \throws std::runtime_error If the receive fails.
-    u64 recv(void* data, u64 size, u64 at_least = 1) {
+    /// \throws net::timed_out If the receive times out.
+    u64 recv(void* data, u64 size, u64 at_least = 1, std::chrono::milliseconds timeout = 1s) {
         if (not connected) throw error("Cannot receive data on a disconnected socket");
         if (at_least > size) throw error("Cannot receive more data than the buffer can hold");
 
         /// Receive data.
         u64 n_read{};
+        auto now = std::chrono::steady_clock::now();
         for (;;) {
-            auto ret = ::recv(fd, data, size, 0);
+            auto ret = ::recv(fd, static_cast<char*>(data) + n_read, size, 0);
             if (ret < 0) {
                 if (errno != EINTR and errno != EAGAIN) raise("recv() failed");
+                if (std::chrono::steady_clock::now() - now > timeout) throw timed_out();
                 continue;
             }
             n_read += ret;
+            size -= ret;
             if (n_read >= at_least) return n_read;
         }
     }

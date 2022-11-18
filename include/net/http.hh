@@ -353,8 +353,8 @@ struct parser {
             return 0;
 
         /// The parser would accept more input, but we don't have any to provide, so we're done.
-        if (state & accepts_more_flag and input.empty()) {
-            state = st_done_state;
+        if (input.empty()) {
+            if (state & accepts_more_flag) state = st_done_state;
             return 0;
         }
 
@@ -362,6 +362,13 @@ struct parser {
         const char* const start = input.data();
         state = parser_impl(input, data, output, state);
         return input.data() - start;
+    }
+
+    /// How many characters the parser wants to consume.
+    [[nodiscard]] u64 want() const {
+        if constexpr (is<result, octets>) return data.len;
+        else if constexpr (is<result, response> or is<result, request>) return data.body_parser.len;
+        else return 0;
     }
 
     /// Check if the parser is done.
@@ -790,21 +797,22 @@ struct parser_state<octets> {
 /// \param message The message whose body we're parsing.
 /// \param state The current state.
 u32 parse_body(std::span<const char>& input, parser_state<octets>& parser, http_message auto& msg, u32 state) {
-    auto& [len, hdrs_parser] = parser;
-
     enum state_t : u32 {
         st_start = body_parser_state,
         st_read_body,
-        st_chunk_size = body_parser_state | chunked_parser_state,
+        st_chunk_size = chunked_parser_state,
+        st_in_chunk_size,
         st_lf_after_chunk_size,
         st_read_chunk,
+        st_cr_after_chunk_data,
+        st_lf_after_chunk_data,
         st_lf_after_last_chunk,
-        st_trailers = body_parser_state | headers_parser_state | chunked_parser_state,
+        st_trailers = body_parser_state | headers_parser_state | chunked_parser_state | accepts_more_flag,
         st_read_until_conn_close = 1u | body_parser_state | accepts_more_flag,
     };
 
     /// Trailers parser.
-    if (state & headers_parser_state) return parse_headers(input, hdrs_parser, msg.hdrs, state);
+    if (state & headers_parser_state) return parse_headers(input, parser.hdrs_parser, msg.hdrs, state);
 
     /// Actual body parser.
     u64 i = 0;
@@ -826,7 +834,7 @@ u32 parse_body(std::span<const char>& input, parser_state<octets>& parser, http_
                 auto t = msg.hdrs["Transfer-Encoding"];
                 if (t and *t != "identity") {
                     state = st_chunk_size;
-                    break; /// Jump to chunked parser.
+                    goto chunked; /// Jump to chunked parser.
                 }
 
                 /// If a Content-Length header field (section 14.13) is present, its
@@ -836,7 +844,7 @@ u32 parse_body(std::span<const char>& input, parser_state<octets>& parser, http_
                 /// If a message is received with both a Transfer-Encoding header field
                 /// and a Content-Length header field, the latter MUST be ignored.
                 if (auto l = msg.hdrs["Content-Length"]; l and (not t or *t == "identity")) {
-                    len = std::stoull(*l);
+                    parser.len = std::stoull(*l);
                     goto read_body;
                 }
 
@@ -848,51 +856,71 @@ u32 parse_body(std::span<const char>& input, parser_state<octets>& parser, http_
             /// Read up to a certain number of bytes from the input.
             read_body:
             case st_read_body: {
-                for (;;) {
-                    auto chunk = std::min<u64>(len, input.size());
-                    msg.body.reserve(msg.body.size() + chunk);
-                    msg.body.insert(
-                        msg.body.end(),
-                        input.begin(),
-                        input.begin() + static_cast<std::ptrdiff_t>(chunk)
-                    );
+                auto chunk = std::min<u64>(parser.len, input.size());
+                msg.body.reserve(msg.body.size() + chunk);
+                msg.body.insert(
+                    msg.body.end(),
+                    input.begin(),
+                    input.begin() + static_cast<std::ptrdiff_t>(chunk)
+                );
 
-                    /// We've read the entire body.
-                    len -= chunk;
-                    if (len == 0) return st_done_state;
+                /// We've read the entire body.
+                parser.len -= chunk;
+                input = input.subspan(chunk);
+                if (parser.len == 0) return st_done_state;
 
-                    /// Need more data.
-                    input = input.subspan(chunk);
-                    return st_read_body;
-                }
+                /// Need more data.
+                return st_read_body;
             }
 
             /// Read the entire input until the connection is closed.
             read_until_conn_close:
             case st_read_until_conn_close: {
-                for (;;) {
-                    msg.body.reserve(msg.body.size() + input.size());
-                    msg.body.insert(
-                        msg.body.end(),
-                        input.begin(),
-                        input.end()
-                    );
+                msg.body.reserve(msg.body.size() + input.size());
+                msg.body.insert(
+                    msg.body.end(),
+                    input.begin(),
+                    input.end()
+                );
 
-                    /// Need more data.
-                    input = input.subspan(input.size());
-                    return st_read_until_conn_close;
-                }
+                /// Need more data.
+                input = input.subspan(input.size());
+                return st_read_until_conn_close;
             }
 
             /// Chunk size.
+            chunked:
             case st_chunk_size: {
                 switch (data[i]) {
-                    case '0' ... '9': len = len * 16 + (data[i] - '0'); break;
-                    case 'a' ... 'f': len = len * 16 + (data[i] - 'a' + 10); break;
-                    case 'A' ... 'F': len = len * 16 + (data[i] - 'A' + 10); break;
+                    case '0' ... '9':
+                    case 'a' ... 'f':
+                    case 'A' ... 'F': {
+                        auto old_len = parser.len;
+                        parser.len *= 16;
+                        parser.len += xtonum(data[i]);
+                        if (parser.len < old_len) ERR("Chunk size overflow");
+                        state = st_in_chunk_size;
+                    } break;
+
+                    default: ERR("Invalid character in chunk size: {}", data[i]);
+                }
+            } break;
+
+            case st_in_chunk_size: {
+                switch (data[i]) {
+                    case '0' ... '9':
+                    case 'a' ... 'f':
+                    case 'A' ... 'F': {
+                        auto old_len = parser.len;
+                        parser.len *= 16;
+                        parser.len += xtonum(data[i]);
+                        if (parser.len < old_len) ERR("Chunk size overflow");
+                    } break;
+
                     case '\r':
-                        state = len == 0 ? st_lf_after_last_chunk : st_lf_after_chunk_size;
+                        state = parser.len == 0 ? st_lf_after_last_chunk : st_lf_after_chunk_size;
                         break;
+
                     default: ERR("Invalid character in chunk size: {}", data[i]);
                 }
             } break;
@@ -915,7 +943,7 @@ u32 parse_body(std::span<const char>& input, parser_state<octets>& parser, http_
 
             /// Read chunk.
             case st_read_chunk: {
-                auto chunk = std::min<u64>(len, input.size() - i);
+                auto chunk = std::min<u64>(parser.len, input.size() - i);
                 msg.body.reserve(msg.body.size() + chunk);
                 msg.body.insert(
                     msg.body.end(),
@@ -924,9 +952,9 @@ u32 parse_body(std::span<const char>& input, parser_state<octets>& parser, http_
                 );
 
                 /// We've read the entire chunk.
-                len -= chunk;
-                if (len == 0) {
-                    state = st_chunk_size;
+                parser.len -= chunk;
+                if (parser.len == 0) {
+                    state = st_cr_after_chunk_data;
                     i += chunk - 1;
                     break;
                 }
@@ -936,10 +964,26 @@ u32 parse_body(std::span<const char>& input, parser_state<octets>& parser, http_
                 return st_read_chunk;
             }
 
+            /// CR after chunk data.
+            case st_cr_after_chunk_data: {
+                switch (data[i]) {
+                    case '\r': state = st_lf_after_chunk_data; break;
+                    default: ERR("Expected CR after chunk data, got {}", data[i]);
+                }
+            } break;
+
+            /// LF after chunk data.
+            case st_lf_after_chunk_data: {
+                switch (data[i]) {
+                    case '\n': state = st_chunk_size; break;
+                    default: ERR("Expected LF after chunk data, got {}", data[i]);
+                }
+            } break;
+
             /// Trailers.
             case st_trailers: {
                 input = input.subspan(i);
-                return parse_headers(input, hdrs_parser, msg.hdrs, headers_parser_state);
+                return parse_headers(input, parser.hdrs_parser, msg.hdrs, headers_parser_state);
             }
         }
     }
@@ -1450,6 +1494,9 @@ using headers_parser = parser<headers, parse_headers, headers_parser_state>;
 using request_parser = parser<request, parse_request, request_parser_state>;
 using response_parser = parser<response, parse_response, response_parser_state>;
 
+template <typename res>
+using body_parser = parser<response, parse_body<res>, body_parser_state>;
+
 #undef ERR
 #undef PERC_FST
 #undef PERC_SND
@@ -1490,31 +1537,38 @@ public:
 
         /// Read the response.
         auto res = response{};
-        auto now = chrono::high_resolution_clock::now();
+        [[maybe_unused]] auto now = chrono::high_resolution_clock::now();
 
         /// TODO: recv in separate thread w/ std::async and std::future to allow for timeouts.
         /// Create a parser.
         auto parser = detail::response_parser{res};
-        for (;;) {
-            /// Allocate space in the buffer.
-            static constexpr u64 increment = 1024;
-            buffer.allocate(increment);
+        try {
+            for (;;) {
+                /// Allocate enough memory to read the entire body if we can.
+                if (parser.state & detail::body_parser_state) buffer.allocate(parser.data.body_parser.len);
 
-            /// Receive data.
-            conn.recv(buffer);
+                /// Receive data.
+                auto sz = buffer.size();
+                conn.recv(buffer, parser.state & detail::body_parser_state ? parser.data.body_parser.len : 0);
+                if (sz == buffer.size()) break;
 
-            /// Advance the parser.
-            auto consumed = parser(buffer);
-            buffer.skip(consumed);
+                /// Advance the parser.
+                auto consumed = parser(buffer);
+                buffer.skip(consumed);
 
-            /// Stop if we're done.
-            if (parser.done()) break;
+                /// Stop if we're done.
+                if (parser.done()) break;
 
-            /// Check if the timeout has been reached.
-            /*if (us_timeout > 0us and chrono::high_resolution_clock::now() - now > us_timeout)
-                throw std::runtime_error("Timeout reached");*/
+                /// Check if the timeout has been reached.
+                //if (us_timeout > 0us and chrono::high_resolution_clock::now() - now > us_timeout)
+                  //  throw std::runtime_error("Timeout reached");
+            }
+        } catch (const timed_out&) {
+            if (not parser.done()) throw std::runtime_error("Timeout reached");
         }
 
+        /*fmt::print("{}", buffer.str());
+        exit(42);*/
         /// Done!
         buffer.erase_to_offset();
         return res;

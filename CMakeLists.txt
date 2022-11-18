@@ -22,8 +22,9 @@ add_custom_target (
 
 ## Other Targets
 
-file(GLOB CLI src/client.cc)
-file(GLOB SRV src/server.cc)
+file(GLOB CLI  src/client.cc)
+file(GLOB SRV  src/server.cc)
+file(GLOB TEST test/*.cc)
 
 set(ENABLE_WEBSOCKETS ON)
 
@@ -31,6 +32,7 @@ add_subdirectory(libs/fmt)
 add_subdirectory(libs/curl)
 add_executable(client ${CLI})
 add_executable(server ${SRV})
+add_executable(tests  ${TEST})
 
 ##
 ## Compile options
@@ -62,3 +64,4 @@ target_link_libraries(options INTERFACE
 
 target_link_libraries(client PRIVATE options fmt libcurl)
 target_link_libraries(server PRIVATE options fmt libcurl)
+target_link_libraries(tests  PRIVATE options fmt libcurl)
