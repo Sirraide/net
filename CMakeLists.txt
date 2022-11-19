@@ -6,6 +6,11 @@ set(CMAKE_CXX_STANDARD 23)
 add_compile_options(-fdiagnostics-color=always -fPIC)
 add_definitions(-DNET_SSL_CERT="${PROJECT_SOURCE_DIR}/libs/openssl/apps/cert.pem")
 
+if (CMAKE_BUILD_TYPE STREQUAL "Release")
+	add_compile_options(-O3 -march=native -mtune=native -flto)
+	add_link_options(-O3 -march=native -mtune=native -flto)
+endif()
+
 ##
 ## Targets
 ##
