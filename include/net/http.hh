@@ -24,6 +24,15 @@ enum struct method {
     post,
 };
 
+constexpr inline std::string_view method_to_str(method meth) {
+    switch (meth) {
+        case method::get: return "GET";
+        case method::head: return "HEAD";
+        case method::post: return "POST";
+    }
+    throw std::runtime_error("Invalid method");
+}
+
 /// HTTP headers.
 template <bool case_insensitive = false>
 struct smap_impl {
@@ -124,19 +133,19 @@ struct response : http_message {
 /// HTTP request.
 struct request : http_message {
     url uri;
-    method meth;
+    method meth = method::get;
 
     /// Create a request.
     explicit request() {}
-    explicit request(url uri, headers _hdrs = {})
-        : uri(std::move(uri)) {
+    explicit request(url _uri, method _meth, headers _hdrs = {})
+        : uri(std::move(_uri)), meth(_meth) {
         hdrs = std::move(_hdrs);
     }
 
     /// Send the request over a connexion.
     template <typename conn_t>
     void send(conn_t& conn) {
-        std::string buf = fmt::format("GET {} HTTP/1.1\r\n", uri.path);
+        std::string buf = fmt::format("{} {} HTTP/1.1\r\n", method_to_str(meth), uri.path);
         if (not uri.params.empty()) {
             buf += '?';
             bool first = true;
@@ -149,7 +158,6 @@ struct request : http_message {
 
         for (const auto& [key, value] : hdrs.values) buf += fmt::format("{}: {}\r\n", key, value);
         buf += "\r\n";
-        fmt::print("Sending request:\n{}\n", buf);
         conn.send(buf);
     }
 };
@@ -333,17 +341,20 @@ public:
     response perform(request&& req, chrono::microseconds us_timeout = 1s) {
         if (us_timeout < 0us) throw std::runtime_error("Timeout must be positive");
 
+        /// Overwrite the host header with the host of the uri.
+        if (not req.uri.host.empty()) req.hdrs["Host"] = req.uri.host;
+
         /// Send the request.
-        req.hdrs["Host"] = conn.host();
+        if (not req.hdrs.has("Host")) req.hdrs["Host"] = conn.host();
         if (not req.hdrs.has("Connection")) req.hdrs["Connection"] = "keep-alive";
         req.send(conn);
 
         /// Read the response.
-        auto res = response{};
+        response res;
         [[maybe_unused]] auto now = chrono::high_resolution_clock::now();
 
         /// Create a parser.
-        auto parser = detail::response_parser{res};
+        detail::response_parser parser{res};
         try {
             for (;;) {
                 /// Allocate enough memory to read the entire body if we can.
@@ -380,7 +391,7 @@ public:
     /// \param hdrs The headers to send.
     /// \return The response.
     response get(url url, headers hdrs = {}) {
-        return perform(request{std::move(url), std::move(hdrs)});
+        return perform(request{std::move(url), method::get, std::move(hdrs)});
     }
 
     /// Perform a GET request.
@@ -389,16 +400,43 @@ public:
     /// \param hdrs The headers to send.
     /// \return The response.
     response get(std::string_view path, headers hdrs = {}) {
-        return perform(request{path, std::move(hdrs)});
+        return perform(request{path, method::get, std::move(hdrs)});
     }
 };
 
+/// Perform a HTTP request.
+inline response perform(url&& uri, method meth, usz max_redirects) {
+    do {
+        /// Perform the request.
+        response res;
+        if (uri.scheme == "https") res = client<net::ssl::client>(uri.host, uri.port).perform(request{uri, meth, {{"Connection", "close"}}});
+        else if (uri.scheme == "http") res = client<net::tcp::client>(uri.host, uri.port).perform(request{uri, meth, {{"Connection", "close"}}});
+        else throw std::runtime_error("Unsupported scheme: " + uri.scheme);
+
+        /// Check if we need to follow a redirect.
+        if (res.status== 301 or res.status == 302 or res.status == 303 or res.status == 307 or res.status == 308) {
+            auto loc = res.hdrs["Location"];
+            if (not loc) throw std::runtime_error("Redirect response missing Location header");
+
+            /// Parse the location.
+            uri = url{*loc};
+            continue;
+        }
+
+        /// If not, then we’re done.
+        return res;
+    } while (max_redirects);
+    throw std::runtime_error("Too many redirects");
+}
+
+/// Perform a HTTP request.
+inline response perform(std::string_view url_raw, method meth, usz max_redirects) {
+    return perform(url{url_raw}, meth, max_redirects);
+}
+
 /// Perform a GET request.
-inline response get(std::string_view url_raw) {
-    url uri{url_raw};
-    if (uri.scheme == "https") return client<net::ssl::client>(uri.host, uri.port).get(uri, {{"Connection", "close"}});
-    if (uri.scheme == "http") return client<net::tcp::client>(uri.host, uri.port).get(uri, {{"Connection", "close"}});
-    throw std::runtime_error("Unsupported scheme: " + uri.scheme);
+inline response get(std::string_view url_raw, usz max_redirects = 10) {
+    return perform(url{url_raw}, method::get, max_redirects);
 }
 } // namespace net::http
 
