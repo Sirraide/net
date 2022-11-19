@@ -34,6 +34,114 @@ net::http::url::url(std::string_view sv) {
     if (parser(sv) != sv.size() or not parser.done()) throw std::runtime_error("Not a valid URL");
 }
 
+constexpr inline bool F = false;
+constexpr inline bool T = true;
+constexpr inline const bool charmap_tchar[128] = {
+    // clang-format off
+    F,F,F,F,F,F,F,F,F,F,
+    F,F,F,F,F,F,F,F,F,F,
+    F,F,F,F,F,F,F,F,F,F,
+    F,F,F,T /*'!'*/,T /*'\"'*/,T /*'#'*/,T /*'$'*/,T /*'%'*/,T /*'&'*/,T /*'\''*/,
+    F,F,T /*'*'*/,T /*'+'*/,F,T /*'-'*/,T /*'.'*/,F,T /*'0'*/,T /*'1'*/,
+    T /*'2'*/,T /*'3'*/,T /*'4'*/,T /*'5'*/,T /*'6'*/,T /*'7'*/,T /*'8'*/,T /*'9'*/,F,F,
+    F,F,F,F,F,T /*'A'*/,T /*'B'*/,T /*'C'*/,T /*'D'*/,T /*'E'*/,
+    T /*'F'*/,T /*'G'*/,T /*'H'*/,T /*'I'*/,T /*'J'*/,T /*'K'*/,T /*'L'*/,T /*'M'*/,T /*'N'*/,T /*'O'*/,
+    T /*'P'*/,T /*'Q'*/,T /*'R'*/,T /*'S'*/,T /*'T'*/,T /*'U'*/,T /*'V'*/,T /*'W'*/,T /*'X'*/,T /*'Y'*/,
+    T /*'Z'*/,F,F,F,T /*'^'*/,T /*'_'*/,T /*'`'*/,T /*'a'*/,T /*'b'*/,T /*'c'*/,
+    T /*'d'*/,T /*'e'*/,T /*'f'*/,T /*'g'*/,T /*'h'*/,T /*'i'*/,T /*'j'*/,T /*'k'*/,T /*'l'*/,T /*'m'*/,
+    T /*'n'*/,T /*'o'*/,T /*'p'*/,T /*'q'*/,T /*'r'*/,T /*'s'*/,T /*'t'*/,T /*'u'*/,T /*'v'*/,T /*'w'*/,
+    T /*'x'*/,T /*'y'*/,T /*'z'*/,F,T /*'|'*/,F,T /*'~'*/,F,
+};
+
+constexpr inline const char charmap_vchar[128] = {
+	F,F,F,F,F,F,F,F,F,F,
+	F,F,F,F,F,F,F,F,F,F,
+	F,F,F,F,F,F,F,F,F,F,
+	F,F,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,F,
+};
+
+constexpr inline const unsigned char charmap_text[256] = {
+	F,F,F,F,F,F,F,F,F,F,
+	F,F,F,F,F,F,F,F,F,F,
+	F,F,F,F,F,F,F,F,F,F,
+	F,F,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,F,
+
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T
+};
+
+constexpr inline const bool charmap_uri[128] = {
+	F,F,F,F,F,F,F,F,F,F,
+	F,F,F,F,F,F,F,F,F,F,
+	F,F,F,F,F,F,F,F,F,F,
+	F,F,F,T,F,T,T,F,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	F,T,F,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,F,T,F,T,F,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,T,T,T,T,T,T,T,
+	T,T,T,F,F,F,T,F,
+}; // clang-format on
+
+/// See RFC 7230.
+constexpr inline bool istchar(char c) {
+    return uint8_t(c) < 128 and charmap_tchar[uint8_t(c)];
+}
+
+/// See RFC 7230.
+constexpr inline bool isvchar(char c) {
+    return uint8_t(c) < 128 and charmap_vchar[uint8_t(c)];
+}
+
+/// See RFC 7230.
+constexpr inline bool istext(unsigned char c) {
+    return charmap_text[c];
+}
+
+/// See RFC 7230.
+constexpr inline bool isurichar(char c) {
+    return uint8_t(c) < 128 and charmap_uri[uint8_t(c)];
+}
+
+constexpr inline i8 xtonum(char c) {
+    if (c >= '0' and c <= '9') return static_cast<i8>(c - '0');
+    else if (c >= 'A' and c <= 'F') return static_cast<i8>(c - 'A') + 10;
+    else if (c >= 'a' and c <= 'f') return static_cast<i8>(c - 'a') + 10;
+    else return -1;
+}
+
 constexpr bool is_gen_delim(char c) {
     return c == ':' or c == '/' or c == '?' or c == '#' or c == '[' or c == ']' or c == '@';
 }
