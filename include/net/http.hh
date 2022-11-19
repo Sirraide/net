@@ -279,7 +279,7 @@ struct parser_state<response> {
 
 /// URI parser.
 ///
-/// Currently, this can only parse the path, query parameters, and fragment of a URI.
+/// Currently, this cannot parse IPv6 addresses.
 u32 parse_uri(std::span<const char>& input, parser_state<url>& parser, url& uri, u32 state);
 
 /// HTTP headers parser.
