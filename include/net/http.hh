@@ -111,7 +111,7 @@ struct url {
     u16 port{};
 
     url() {}
-    url(std::string_view);
+    url(std::string_view, bool allow_empty_scheme = false);
 };
 
 /// HTTP Message.
@@ -251,6 +251,7 @@ struct parser_state<url> {
     std::string parse_buffer1;
     std::string parse_buffer2;
     u8 fst{};
+    bool allow_empty_scheme{};
 };
 
 /// Headers parser state.

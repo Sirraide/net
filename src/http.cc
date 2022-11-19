@@ -28,10 +28,13 @@
         break;                               \
     } while (0)
 
-net::http::url::url(std::string_view sv) {
+net::http::url::url(std::string_view sv, bool allow_empty_scheme) {
     /// Parse the url.
     detail::uri_parser parser{*this};
-    if (parser(sv) != sv.size() or not parser.done()) throw std::runtime_error("Not a valid URL");
+    parser.data.allow_empty_scheme = allow_empty_scheme;
+    parser.state = detail::uri_parser_state | detail::accepts_more_flag;
+    if (parser(sv) != sv.size() or not parser.done())
+        throw std::runtime_error("Not a valid URL");
 }
 
 constexpr inline bool F = false;
@@ -178,7 +181,7 @@ constexpr bool is_unreserved(char c) {
 
 u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>& parser, url& uri, u32 state) {
     /// Parse the request/status line.
-    auto& [parse_buffer1, parse_buffer2, fst] = parser;
+    auto& [parse_buffer1, parse_buffer2, fst, allow_empty_scheme] = parser;
     const char* data = input.data();
     u64 i = 0;
     u64 start = 0;
@@ -187,7 +190,6 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
         st_start = uri_parser_state,
         st_uri_scheme,
         st_uri_hier_part_slash,
-        st_uri_authority_start,
         st_uri_authority_percent,
         st_uri_authority_percent_2,
         st_uri_host,
@@ -199,26 +201,31 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
         st_i4_3,
         st_i4_delim,
 
-        st_uri_param_name_init,
         st_uri_path_percent,
         st_uri_path_percent_2,
         st_uri_param_name_percent,
         st_uri_param_name_percent_2,
-        st_uri_param_val_init,
         st_uri_param_val_percent,
         st_uri_param_val_percent_2,
-        st_uri_fragment_init,
         st_uri_fragment_percent,
         st_uri_fragment_percent_2,
 
+        st_start_allow_empty = uri_parser_state | accepts_more_flag,
         st_uri_hier_part = 1u | uri_parser_state | accepts_more_flag,
         st_uri_hostname = 2u | uri_parser_state | accepts_more_flag,
         st_uri_port = 3u | uri_parser_state | accepts_more_flag,
         st_uri_authority = 4u | uri_parser_state | accepts_more_flag,
         st_uri_path = 5u | uri_parser_state | accepts_more_flag,
-        st_uri_param_name = 6u | uri_parser_state | accepts_more_flag,
-        st_uri_param_val = 7u | uri_parser_state | accepts_more_flag,
-        st_uri_fragment = 8u | uri_parser_state | accepts_more_flag,
+        st_uri_path_start = 6u | uri_parser_state | accepts_more_flag,
+        st_uri_param_name = 7u | uri_parser_state | accepts_more_flag,
+        st_uri_param_val = 8u | uri_parser_state | accepts_more_flag,
+        st_uri_fragment = 9u | uri_parser_state | accepts_more_flag,
+        st_uri_param_name_init = 10u | uri_parser_state | accepts_more_flag,
+        st_uri_param_val_init = 11u | uri_parser_state | accepts_more_flag,
+        st_uri_fragment_init = 12u | uri_parser_state | accepts_more_flag,
+        st_uri_scheme_allow_empty = 13u | uri_parser_state | accepts_more_flag,
+        st_uri_hier_part_slash_allow_empty = 14u | uri_parser_state | accepts_more_flag,
+        st_uri_authority_start = 15u | uri_parser_state | accepts_more_flag,
     };
 
     static const auto validate_ip = [](url& uri) {
@@ -229,24 +236,28 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
     for (; i < input.size(); i++) {
         switch (static_cast<state_t>(state)) {
             /// URI parser.
-            case st_start: {
+            case st_start:
+            case st_start_allow_empty: {
                 start = i;
-                switch (data[i]) {
-                    /// This is technically not a valid URI, but we allow it
-                    /// because URI paths sans scheme + authority are commonly
-                    /// found in HTTP request lines.
-                    /// TODO: Separate function or flag or sth.
-                    case '/':
-                        state = st_uri_path;
-                        break;
-                    default:
-                        if (is_alpha(data[i])) {
-                            state = st_uri_scheme;
-                            break;
-                        }
-
-                        ERR("Invalid URI scheme");
+                if (is_alpha(data[i])) {
+                    state = allow_empty_scheme ? st_uri_scheme_allow_empty : st_uri_scheme;
+                    break;
                 }
+
+                /// If we allow the absence of a scheme, then we don’t know
+                /// what we’re parsing until we find a delimiter.
+                if (allow_empty_scheme) {
+                    switch (data[i]) {
+                        case '/': state = st_uri_hier_part_slash_allow_empty; break;
+                        case '?': state = st_uri_param_name_init; break;
+                        case '#': state = st_uri_fragment_init; break;
+                        case '%': state = st_uri_path_percent; break;
+                        default:
+                            if (not isurichar(data[i])) ERR("Invalid character in URI path: '{}'", data[i]);
+                            state = st_uri_path;
+                            break;
+                    }
+                } else ERR("Invalid URI scheme");
             } break;
 
             case st_uri_scheme: {
@@ -261,13 +272,52 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                 }
             } break;
 
+            case st_uri_scheme_allow_empty: {
+                switch (data[i]) {
+                    case ':':
+                        uri.path.append(data + start, data + i);
+                        std::transform(uri.path.begin(), uri.path.end(), std::back_inserter(uri.scheme), [](char c) { return std::tolower(c); });
+                        uri.path.clear();
+                        state = st_uri_hier_part;
+                        break;
+                    default:
+                        if (is_alnum(data[i]) or data[i] == '+' or data[i] == '-' or data[i] == '.') break;
+                        switch (data[i]) {
+                            case '/': state = st_uri_path; break;
+                            case '?':
+                                uri.path.append(data + start, data + i);
+                                state = st_uri_param_name_init;
+                                break;
+                            case '#':
+                                uri.path.append(data + start, data + i);
+                                state = st_uri_fragment_init;
+                                break;
+                            case '%':
+                                uri.path.append(data + start, data + i);
+                                state = st_uri_path_percent;
+                                break;
+                            default:
+                                if (not isurichar(data[i])) ERR("Invalid character in URI path: '{}'", data[i]);
+                                state = st_uri_path;
+                                break;
+                        }
+                }
+            } break;
+
             /// Handles <authority> <path-abempty>, <path-absolute>, and <path-rootless>.
             /// <path-empty> is handled by returning from the function.
-            case st_uri_hier_part: {
+            case st_uri_hier_part:
+            case st_uri_hier_part_slash_allow_empty: {
                 switch (data[i]) {
                     /// <authority> <path-abempty> | <path-absolute>
                     case '/':
-                        state = st_uri_hier_part_slash;
+                        state = allow_empty_scheme ? st_uri_hier_part_slash_allow_empty : st_uri_hier_part_slash;
+                        break;
+                    case '?':
+                        state = st_uri_param_name_init;
+                        break;
+                    case '#':
+                        state = st_uri_fragment_init;
                         break;
                     /// <path-rootless>
                     default:
@@ -282,7 +332,14 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                 switch (data[i]) {
                     /// <authority> <path-abempty>
                     case '/':
+                        uri.path.clear();
                         state = st_uri_authority_start;
+                        break;
+                    case '?':
+                        state = st_uri_param_name_init;
+                        break;
+                    case '#':
+                        state = st_uri_fragment_init;
                         break;
                     /// <path-absolute>
                     default:
@@ -312,6 +369,14 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         uri.host.append(data + start, i - start);
                         start = i;
                         state = st_uri_path;
+                        break;
+                    case '?':
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_param_name_init;
+                        break;
+                    case '#':
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_fragment_init;
                         break;
                     case '%':
                         uri.host.append(data + start, i - start);
@@ -362,6 +427,14 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         uri.host.append(data + start, i - start);
                         state = st_uri_path;
                         break;
+                    case '?':
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_param_name_init;
+                        break;
+                    case '#':
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_fragment_init;
+                        break;
                     default:
                         if (is_unreserved(data[i]) or is_sub_delim(data[i]) or data[i] == ':') break;
                         ERR("Invalid URI hostname");
@@ -393,6 +466,14 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         uri.host.append(data + start, i - start);
                         state = st_uri_path;
                         break;
+                    case '?':
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_param_name_init;
+                        break;
+                    case '#':
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_fragment_init;
+                        break;
                     default:
                         if (not is_unreserved(data[i]) and not is_sub_delim(data[i])) ERR("Invalid URI hostname");
                         state = st_uri_hostname;
@@ -414,6 +495,14 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                     case '/':
                         uri.host.append(data + start, i - start);
                         state = st_uri_path;
+                        break;
+                    case '?':
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_param_name_init;
+                        break;
+                    case '#':
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_fragment_init;
                         break;
                     default:
                         if (not is_unreserved(data[i]) and not is_sub_delim(data[i])) ERR("Invalid URI hostname");
@@ -440,6 +529,14 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         uri.host.append(data + start, i - start);
                         state = st_uri_path;
                         break;
+                    case '?':
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_param_name_init;
+                        break;
+                    case '#':
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_fragment_init;
+                        break;
                     default:
                     check_host:
                         if (not is_unreserved(data[i]) and not is_sub_delim(data[i])) ERR("Invalid URI hostname");
@@ -454,6 +551,14 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         start = i;
                         state = st_uri_path;
                         break;
+                    case '?':
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_param_name_init;
+                        break;
+                    case '#':
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_fragment_init;
+                        break;
                     default:
                         if (not is_digit(data[i])) ERR("Invalid URI port");
                         u16 old_port = uri.port;
@@ -462,6 +567,11 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         break;
                 }
             } break;
+
+            case st_uri_path_start: {
+                start = i;
+                [[fallthrough]];
+            }
 
             case st_uri_path: {
                 switch (data[i]) {
@@ -495,7 +605,7 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
             } break;
 
             case st_uri_path_percent_2: {
-                PERC_SND(st_start, parse_buffer1);
+                PERC_SND(st_uri_path_start, parse_buffer1);
             } break;
 
             /// URI param name.
@@ -634,6 +744,8 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
             case st_uri_scheme: uri.scheme.append(data + start, u64(i - start)); break;
             case st_uri_authority:
             case st_uri_hostname: uri.host.append(data + start, u64(i - start)); break;
+            case st_uri_scheme_allow_empty: /// (!)
+            case st_uri_hier_part_slash_allow_empty: /// (!)
             case st_uri_path: uri.path.append(data + start, u64(i - start)); break;
             case st_uri_param_name: parse_buffer1.append(data + start, u64(i - start)); break;
             case st_uri_param_val: parse_buffer2.append(data + start, u64(i - start)); break;
