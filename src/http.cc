@@ -632,8 +632,8 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
         /// Append remaining data.
         switch (state) {
             case st_uri_scheme: uri.scheme.append(data + start, u64(i - start)); break;
-            case st_uri_hostname: uri.host.append(data + start, u64(i - start)); break;
             case st_uri_authority:
+            case st_uri_hostname: uri.host.append(data + start, u64(i - start)); break;
             case st_uri_path: uri.path.append(data + start, u64(i - start)); break;
             case st_uri_param_name: parse_buffer1.append(data + start, u64(i - start)); break;
             case st_uri_param_val: parse_buffer2.append(data + start, u64(i - start)); break;

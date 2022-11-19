@@ -72,7 +72,7 @@ public:
         if (auto code = ::getaddrinfo(host.data(), nullptr, &hints, &res); code != 0) {
             ::close(fd);
             fd = -1;
-            throw std::runtime_error(fmt::format("getaddrinfo() failed: %s", gai_strerror(code)));
+            throw std::runtime_error(fmt::format("getaddrinfo() failed to resolve \"{}:{}\": {}", host, port, gai_strerror(code)));
         }
         defer { ::freeaddrinfo(res); };
 

@@ -342,13 +342,16 @@ public:
     response perform(request&& req, chrono::microseconds us_timeout = 1s) {
         if (us_timeout < 0us) throw std::runtime_error("Timeout must be positive");
 
+        /// Make sure the path isn’t empty.
+        if (req.uri.path.empty()) req.uri.path = "/";
+
         /// Overwrite the host header with the host of the uri.
         if (not req.uri.host.empty()) req.hdrs["Host"] = req.uri.host;
 
         /// Send the request.
         if (not req.hdrs.has("Host")) req.hdrs["Host"] = conn.host();
         if (not req.hdrs.has("Connection")) req.hdrs["Connection"] = "keep-alive";
-        if (not req.hdrs.has("Accept-Encoding")) req.hdrs["Accept-Encoding"] = "gzip";
+        if (not req.hdrs.has("Accept-Encoding")) req.hdrs["Accept-Encoding"] = "deflate, gzip";
         req.send(conn);
 
         /// Read the response.
@@ -382,8 +385,19 @@ public:
             if (not parser.done()) throw std::runtime_error("Timeout reached");
         }
 
-        /// If the response is gzipped, decompress it.
-        if (res.hdrs.has("Content-Encoding") and *res.hdrs["Content-Encoding"] == "gzip") {
+        /// Handle gzip, compress, and deflate using zlib’s C API.
+        if (res.hdrs.has("Content-Encoding")) {
+            enum {
+                compress,
+                deflate,
+                gzip,
+            } encoding;
+
+            if (auto& enc = *res.hdrs["Content-Encoding"]; enc == "gzip" or enc == "x-gzip") encoding = gzip;
+            else if (enc == "compress" or enc == "x-compress") encoding = compress;
+            else if (enc == "deflate") encoding = deflate;
+            else throw std::runtime_error(fmt::format("Unknown Content-Encoding: {}", enc));
+
             /// Create a stream.
             z_stream stream;
             stream.zalloc = Z_NULL;
@@ -391,20 +405,36 @@ public:
             stream.opaque = Z_NULL;
             stream.avail_in = 0;
             stream.next_in = Z_NULL;
-            if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK) throw std::runtime_error("Failed to initialize zlib");
+
+            /// Initialize the stream.
+            if (encoding == gzip) {
+                if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK) throw std::runtime_error("inflateInit2 failed");
+            } else if (encoding == compress) {
+                if (inflateInit(&stream) != Z_OK) throw std::runtime_error("inflateInit failed");
+            } else if (encoding == deflate) {
+                if (inflateInit2(&stream, -MAX_WBITS) != Z_OK) throw std::runtime_error("inflateInit2 failed");
+            }
 
             /// Decompress the body.
-            octets decompressed;
             stream.avail_in = res.body.size();
             stream.next_in = reinterpret_cast<Bytef*>(res.body.data());
+            octets decompressed;
             do {
                 decompressed.resize(decompressed.size() + 1024);
-                stream.avail_out = decompressed.size() - stream.total_out;
-                stream.next_out = reinterpret_cast<Bytef*>(decompressed.data()) + stream.total_out;
-                inflate(&stream, Z_NO_FLUSH);
+                stream.avail_out = 1024;
+                stream.next_out = reinterpret_cast<Bytef*>(decompressed.data() + decompressed.size() - 1024);
+                auto ret = inflate(&stream, Z_NO_FLUSH);
+                switch (ret) {
+                    case Z_NEED_DICT:
+                    case Z_DATA_ERROR:
+                    case Z_MEM_ERROR:
+                        inflateEnd(&stream);
+                        throw std::runtime_error("inflate failed");
+                    default: break;
+                }
+                decompressed.resize(decompressed.size() - stream.avail_out);
             } while (stream.avail_out == 0);
             inflateEnd(&stream);
-            decompressed.resize(stream.total_out);
             res.body = std::move(decompressed);
         }
 
