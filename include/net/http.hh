@@ -94,7 +94,7 @@ using octets = std::vector<char>;
 struct url {
     std::string scheme;
     std::string userinfo;
-    std::variant<std::string, in_addr> host;
+    std::string host;
     std::string path;
     std::string fragment;
     smap_impl<false> params;
@@ -241,7 +241,6 @@ template <>
 struct parser_state<url> {
     std::string parse_buffer1;
     std::string parse_buffer2;
-    u64 start{};
     u8 fst{};
 };
 
@@ -250,7 +249,6 @@ template <>
 struct parser_state<headers> {
     std::string name;
     std::string value;
-    u64 start{};
 };
 
 /// Body parser state.
@@ -264,7 +262,6 @@ struct parser_state<octets> {
 /// Request parser state.
 template <>
 struct parser_state<request> {
-    u64 start{};
     parser_state<url> url_parser;
     parser_state<headers> hdrs_parser;
     parser_state<octets> body_parser;
@@ -315,7 +312,7 @@ using request_parser = parser<request, parse_request, request_parser_state>;
 using response_parser = parser<response, parse_response, response_parser_state>;
 } // namespace detail
 
-template <typename backend_t = tcp::client, u16 default_port = 80>
+template <typename backend_t = tcp::client, u16 default_port = std::is_same_v<backend_t, net::ssl::client> ? 443 : 80>
 struct client {
 protected:
     using backend_type = backend_t;
@@ -324,7 +321,7 @@ protected:
 
 public:
     explicit client() : conn() {}
-    explicit client(std::string_view host_name, u16 port = default_port) : conn(host_name, port) {}
+    explicit client(std::string_view host_name, u16 port = default_port) : conn(host_name, port ?: default_port) {}
 
     /// Perform a request.
     ///
@@ -397,10 +394,11 @@ public:
 };
 
 /// Perform a GET request.
-inline response get(std::string_view url) {
-    return url.starts_with("https")
-               ? client<net::ssl::client>().get(url, {{"Connection", "close"}})
-               : client<net::tcp::client>().get(url, {{"Connection", "close"}});
+inline response get(std::string_view url_raw) {
+    url uri{url_raw};
+    if (uri.scheme == "https") return client<net::ssl::client>(uri.host, uri.port).get(uri, {{"Connection", "close"}});
+    if (uri.scheme == "http") return client<net::tcp::client>(uri.host, uri.port).get(uri, {{"Connection", "close"}});
+    throw std::runtime_error("Unsupported scheme: " + uri.scheme);
 }
 } // namespace net::http
 

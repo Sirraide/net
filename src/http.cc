@@ -178,17 +178,18 @@ constexpr bool is_unreserved(char c) {
 
 u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>& parser, url& uri, u32 state) {
     /// Parse the request/status line.
-    auto& [parse_buffer1, parse_buffer2, start, fst] = parser;
+    auto& [parse_buffer1, parse_buffer2, fst] = parser;
     const char* data = input.data();
     u64 i = 0;
+    u64 start = 0;
 
     enum state_t : u32 {
         st_start = uri_parser_state,
         st_uri_scheme,
         st_uri_hier_part_slash,
-        st_uri_userinfo_or_path_start,
-        st_uri_userinfo_or_path_percent,
-        st_uri_userinfo_or_path_percent_2,
+        st_uri_authority_start,
+        st_uri_authority_percent,
+        st_uri_authority_percent_2,
         st_uri_host,
         st_i6,
 
@@ -213,17 +214,16 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
         st_uri_hier_part = 1u | uri_parser_state | accepts_more_flag,
         st_uri_hostname = 2u | uri_parser_state | accepts_more_flag,
         st_uri_port = 3u | uri_parser_state | accepts_more_flag,
-        st_uri_userinfo_or_path = 4u | uri_parser_state | accepts_more_flag,
+        st_uri_authority = 4u | uri_parser_state | accepts_more_flag,
         st_uri_path = 5u | uri_parser_state | accepts_more_flag,
         st_uri_param_name = 6u | uri_parser_state | accepts_more_flag,
         st_uri_param_val = 7u | uri_parser_state | accepts_more_flag,
         st_uri_fragment = 8u | uri_parser_state | accepts_more_flag,
     };
 
-    static const auto convert_ip = [](url& uri) {
+    static const auto validate_ip = [](url& uri) {
         in_addr a{};
-        if (inet_pton(AF_INET, std::get<std::string>(uri.host).data(), &a) == 1) uri.host = a;
-        else ERR("Invalid IPv4 address");
+        if (inet_pton(AF_INET, uri.host.data(), &a) != 1) ERR("Invalid IPv4 address");
     };
 
     for (; i < input.size(); i++) {
@@ -282,7 +282,7 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                 switch (data[i]) {
                     /// <authority> <path-abempty>
                     case '/':
-                        state = st_uri_userinfo_or_path_start;
+                        state = st_uri_authority_start;
                         break;
                     /// <path-absolute>
                     default:
@@ -293,41 +293,45 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                 }
             } break;
 
-            case st_uri_userinfo_or_path_start: {
+            case st_uri_authority_start: {
                 start = i;
                 [[fallthrough]];
             }
 
-            case st_uri_userinfo_or_path: {
+            case st_uri_authority: {
                 switch (data[i]) {
                     case '@':
                         /// If we get here, then we’ve actually been parsing the userinfo,
-                        /// and not a path, so we need to move it into the right place and
+                        /// and not the host, so we need to move it into the right place and
                         /// parse the host.
-                        std::exchange(uri.userinfo, uri.path);
+                        std::exchange(uri.userinfo, uri.host);
                         uri.userinfo.append(data + start, i - start);
                         state = st_uri_host;
                         break;
                     case '/':
+                        uri.host.append(data + start, i - start);
                         start = i;
                         state = st_uri_path;
                         break;
                     case '%':
-                        uri.path.append(data + start, i - start);
-                        state = st_uri_userinfo_or_path_percent;
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_authority_percent;
                         break;
                     default:
-                        if (is_unreserved(data[i]) or is_sub_delim(data[i]) or data[i] == ':') break;
+                        if (is_unreserved(data[i]) or is_sub_delim(data[i]) or data[i] == ':') {
+                            state = st_uri_authority;
+                            break;
+                        }
                         ERR("Invalid URI authority");
                 }
             } break;
 
-            case st_uri_userinfo_or_path_percent: {
-                PERC_FST(st_uri_userinfo_or_path_percent_2);
+            case st_uri_authority_percent: {
+                PERC_FST(st_uri_authority_percent_2);
             } break;
 
-            case st_uri_userinfo_or_path_percent_2: {
-                PERC_SND(st_uri_userinfo_or_path_start, uri.path);
+            case st_uri_authority_percent_2: {
+                PERC_SND(st_uri_authority_start, uri.host);
             } break;
 
             case st_uri_host: {
@@ -336,8 +340,8 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         state = st_i6;
                         break;
                     default:
+                        start = i;
                         if (is_digit(data[i])) {
-                            start = i;
                             fst = 0;
                             state = st_i4;
                             break;
@@ -351,11 +355,11 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
             case st_uri_hostname: {
                 switch (data[i]) {
                     case ':':
-                        uri.host = std::string(data + start, i - start);
+                        uri.host.append(data + start, i - start);
                         state = st_uri_port;
                         break;
                     case '/':
-                        uri.host = std::string(data + start, i - start);
+                        uri.host.append(data + start, i - start);
                         state = st_uri_path;
                         break;
                     default:
@@ -381,8 +385,13 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         fst++;
                         break;
                     case ':':
-                        if (fst == 3) convert_ip(uri);
+                        if (fst == 3) validate_ip(uri);
+                        uri.host.append(data + start, i - start);
                         state = st_uri_port;
+                        break;
+                    case '/':
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_path;
                         break;
                     default:
                         if (not is_unreserved(data[i]) and not is_sub_delim(data[i])) ERR("Invalid URI hostname");
@@ -398,8 +407,13 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         fst++;
                         break;
                     case ':':
-                        if (fst == 3) convert_ip(uri);
+                        if (fst == 3) validate_ip(uri);
+                        uri.host.append(data + start, i - start);
                         state = st_uri_port;
+                        break;
+                    case '/':
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_path;
                         break;
                     default:
                         if (not is_unreserved(data[i]) and not is_sub_delim(data[i])) ERR("Invalid URI hostname");
@@ -418,11 +432,12 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
 
                 switch (data[i]) {
                     case ':':
-                        if (fst == 3) convert_ip(uri);
+                        if (fst == 3) validate_ip(uri);
+                        uri.host.append(data + start, i - start);
                         state = st_uri_port;
                         break;
                     case '/':
-                        uri.host = std::string(data + start, i - start);
+                        uri.host.append(data + start, i - start);
                         state = st_uri_path;
                         break;
                     default:
@@ -441,8 +456,9 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         break;
                     default:
                         if (not is_digit(data[i])) ERR("Invalid URI port");
+                        u16 old_port = uri.port;
                         uri.port = uri.port * 10 + (data[i] - '0');
-                        if (++fst > 5 or uri.port > UINT16_MAX) ERR("Invalid URI port");
+                        if (++fst > 5 or uri.port < old_port) ERR("Invalid URI port");
                         break;
                 }
             } break;
@@ -616,8 +632,8 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
         /// Append remaining data.
         switch (state) {
             case st_uri_scheme: uri.scheme.append(data + start, u64(i - start)); break;
-            case st_uri_hostname: std::get<std::string>(uri.host).append(data + start, u64(i - start)); break;
-            case st_uri_userinfo_or_path:
+            case st_uri_hostname: uri.host.append(data + start, u64(i - start)); break;
+            case st_uri_authority:
             case st_uri_path: uri.path.append(data + start, u64(i - start)); break;
             case st_uri_param_name: parse_buffer1.append(data + start, u64(i - start)); break;
             case st_uri_param_val: parse_buffer2.append(data + start, u64(i - start)); break;
@@ -640,9 +656,10 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
 
 u32 net::http::detail::parse_headers(std::span<const char>& input, parser_state<headers>& parser, headers& hdrs, u32 state) {
     /// Parse the request/status line.
-    auto& [name, value, start] = parser;
+    auto& [name, value] = parser;
     const char* data = input.data();
     u64 i = 0;
+    u64 start = 0;
 
     enum state_t : u32 {
         st_start = headers_parser_state,
@@ -999,9 +1016,10 @@ u32 net::http::detail::parse_body(std::span<const char>& input, parser_state<oct
 
 u32 net::http::detail::parse_request(std::span<const char>& input, parser_state<request>& parser, request& req, u32 state) {
     /// Parse the request/status line.
-    auto& [start, url_parser, hdrs_parser, body_parser] = parser;
+    auto& [url_parser, hdrs_parser, body_parser] = parser;
     const char* data = input.data();
     u64 i = 0;
+    u64 start = 0;
 
     enum state_t : u32 {
         st_start = request_parser_state,
