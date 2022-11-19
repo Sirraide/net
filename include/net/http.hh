@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <utility>
 #include <variant>
+#include <zlib.h>
 
 namespace net::http {
 
@@ -347,6 +348,7 @@ public:
         /// Send the request.
         if (not req.hdrs.has("Host")) req.hdrs["Host"] = conn.host();
         if (not req.hdrs.has("Connection")) req.hdrs["Connection"] = "keep-alive";
+        if (not req.hdrs.has("Accept-Encoding")) req.hdrs["Accept-Encoding"] = "gzip";
         req.send(conn);
 
         /// Read the response.
@@ -380,6 +382,32 @@ public:
             if (not parser.done()) throw std::runtime_error("Timeout reached");
         }
 
+        /// If the response is gzipped, decompress it.
+        if (res.hdrs.has("Content-Encoding") and *res.hdrs["Content-Encoding"] == "gzip") {
+            /// Create a stream.
+            z_stream stream;
+            stream.zalloc = Z_NULL;
+            stream.zfree = Z_NULL;
+            stream.opaque = Z_NULL;
+            stream.avail_in = 0;
+            stream.next_in = Z_NULL;
+            if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK) throw std::runtime_error("Failed to initialize zlib");
+
+            /// Decompress the body.
+            octets decompressed;
+            stream.avail_in = res.body.size();
+            stream.next_in = reinterpret_cast<Bytef*>(res.body.data());
+            do {
+                decompressed.resize(decompressed.size() + 1024);
+                stream.avail_out = decompressed.size() - stream.total_out;
+                stream.next_out = reinterpret_cast<Bytef*>(decompressed.data()) + stream.total_out;
+                inflate(&stream, Z_NO_FLUSH);
+            } while (stream.avail_out == 0);
+            inflateEnd(&stream);
+            decompressed.resize(stream.total_out);
+            res.body = std::move(decompressed);
+        }
+
         /// Done!
         buffer.erase_to_offset();
         return res;
@@ -405,29 +433,7 @@ public:
 };
 
 /// Perform a HTTP request.
-inline response perform(url&& uri, method meth, usz max_redirects) {
-    do {
-        /// Perform the request.
-        response res;
-        if (uri.scheme == "https") res = client<net::ssl::client>(uri.host, uri.port).perform(request{uri, meth, {{"Connection", "close"}}});
-        else if (uri.scheme == "http") res = client<net::tcp::client>(uri.host, uri.port).perform(request{uri, meth, {{"Connection", "close"}}});
-        else throw std::runtime_error("Unsupported scheme: " + uri.scheme);
-
-        /// Check if we need to follow a redirect.
-        if (res.status== 301 or res.status == 302 or res.status == 303 or res.status == 307 or res.status == 308) {
-            auto loc = res.hdrs["Location"];
-            if (not loc) throw std::runtime_error("Redirect response missing Location header");
-
-            /// Parse the location.
-            uri = url{*loc};
-            continue;
-        }
-
-        /// If not, then we’re done.
-        return res;
-    } while (max_redirects);
-    throw std::runtime_error("Too many redirects");
-}
+response perform(url&& uri, method meth, usz max_redirects);
 
 /// Perform a HTTP request.
 inline response perform(std::string_view url_raw, method meth, usz max_redirects) {

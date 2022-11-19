@@ -1486,3 +1486,28 @@ u32 net::http::detail::parse_response(std::span<const char>& input, parser_state
     input = input.subspan(i);
     return state;
 }
+
+/// Perform a HTTP request.
+auto net::http::perform(url&& uri, method meth, usz max_redirects) -> response {
+    do {
+        /// Perform the request.
+        response res;
+        if (uri.scheme == "https") res = client<net::ssl::client>(uri.host, uri.port).perform(request{uri, meth, {{"Connection", "close"}}});
+        else if (uri.scheme == "http") res = client<net::tcp::client>(uri.host, uri.port).perform(request{uri, meth, {{"Connection", "close"}}});
+        else throw std::runtime_error("Unsupported scheme: " + uri.scheme);
+
+        /// Check if we need to follow a redirect.
+        if (res.status== 301 or res.status == 302 or res.status == 303 or res.status == 307 or res.status == 308) {
+            auto loc = res.hdrs["Location"];
+            if (not loc) throw std::runtime_error("Redirect response missing Location header");
+
+            /// Parse the location.
+            uri = url{*loc};
+            continue;
+        }
+
+        /// If not, then we’re done.
+        return res;
+    } while (max_redirects--);
+    throw std::runtime_error("Too many redirects");
+}

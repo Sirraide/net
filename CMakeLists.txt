@@ -2,7 +2,6 @@ cmake_minimum_required(VERSION 3.21)
 project(net VERSION 1.0.0)
 
 set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})
 
 add_compile_options(-fdiagnostics-color=always -fPIC)
 add_definitions(-DNET_SSL_CERT="${PROJECT_SOURCE_DIR}/libs/openssl/apps/cert.pem")
@@ -30,6 +29,7 @@ file(GLOB NET  src/*.cc)
 
 add_subdirectory(libs/fmt)
 add_subdirectory(libs/curl)
+add_subdirectory(libs/zlib)
 add_library(net STATIC ${NET})
 add_executable(client ${CLI})
 add_executable(server ${SRV})
@@ -53,7 +53,13 @@ else ()
 	target_link_options(options INTERFACE -rdynamic)
 endif ()
 
-target_include_directories(options INTERFACE include libs/fmt/include libs/json/include libs/curl/include)
+target_include_directories(options INTERFACE
+	include
+	libs
+	libs/fmt/include
+	libs/json/include
+	libs/curl/include
+)
 
 add_dependencies(options openssl)
 
@@ -64,6 +70,7 @@ add_dependencies(options openssl)
 target_link_libraries(net PUBLIC
 	fmt
 	libcurl
+	zlib
 	${PROJECT_SOURCE_DIR}/libs/libcrypto.so
 	${PROJECT_SOURCE_DIR}/libs/libssl.so
 )
@@ -72,3 +79,7 @@ target_link_libraries(net    PRIVATE options)
 target_link_libraries(client PRIVATE options net)
 target_link_libraries(server PRIVATE options net)
 target_link_libraries(tests  PRIVATE options net)
+
+set_target_properties(client PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}")
+set_target_properties(server PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}")
+set_target_properties(tests  PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}")
