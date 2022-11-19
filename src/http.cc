@@ -348,6 +348,22 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                 }
             } break;
 
+            case st_uri_hostname: {
+                switch (data[i]) {
+                    case ':':
+                        uri.host = std::string(data + start, i - start);
+                        state = st_uri_port;
+                        break;
+                    case '/':
+                        uri.host = std::string(data + start, i - start);
+                        state = st_uri_path;
+                        break;
+                    default:
+                        if (is_unreserved(data[i]) or is_sub_delim(data[i]) or data[i] == ':') break;
+                        ERR("Invalid URI hostname");
+                }
+            } break;
+
             case st_i6: {
                 ERR("IPv6 addresses are not supported");
             }
