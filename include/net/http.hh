@@ -9,6 +9,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 
 namespace net::http {
 
@@ -93,7 +94,7 @@ using octets = std::vector<char>;
 struct url {
     std::string scheme;
     std::string userinfo;
-    std::string host;
+    std::variant<std::string, in_addr> host;
     std::string path;
     std::string fragment;
     smap_impl<false> params;

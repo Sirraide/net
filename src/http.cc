@@ -52,6 +52,10 @@ constexpr bool is_digit(char c) {
     return c >= '0' and c <= '9';
 }
 
+[[gnu::flatten]] constexpr bool is_xdigit(char c) {
+    return is_digit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+}
+
 [[gnu::flatten]] constexpr bool is_alnum(char c) {
     return is_alpha(c) or is_digit(c);
 }
@@ -77,6 +81,15 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
         st_uri_userinfo_or_path_start,
         st_uri_userinfo_or_path_percent,
         st_uri_userinfo_or_path_percent_2,
+        st_uri_host,
+        st_i6,
+
+        /// These 4 MUST be consecutive.
+        st_i4,
+        st_i4_2,
+        st_i4_3,
+        st_i4_delim,
+
         st_uri_param_name_init,
         st_uri_path_percent,
         st_uri_path_percent_2,
@@ -90,12 +103,19 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
         st_uri_fragment_percent_2,
 
         st_uri_hier_part = 1u | uri_parser_state | accepts_more_flag,
-        st_uri_host = 2u | uri_parser_state | accepts_more_flag,
-        st_uri_userinfo_or_path = 3u | uri_parser_state | accepts_more_flag,
-        st_uri_path = 4u | uri_parser_state | accepts_more_flag,
-        st_uri_param_name = 5u | uri_parser_state | accepts_more_flag,
-        st_uri_param_val = 6u | uri_parser_state | accepts_more_flag,
-        st_uri_fragment = 7u | uri_parser_state | accepts_more_flag,
+        st_uri_hostname = 2u | uri_parser_state | accepts_more_flag,
+        st_uri_port = 3u | uri_parser_state | accepts_more_flag,
+        st_uri_userinfo_or_path = 4u | uri_parser_state | accepts_more_flag,
+        st_uri_path = 5u | uri_parser_state | accepts_more_flag,
+        st_uri_param_name = 6u | uri_parser_state | accepts_more_flag,
+        st_uri_param_val = 7u | uri_parser_state | accepts_more_flag,
+        st_uri_fragment = 8u | uri_parser_state | accepts_more_flag,
+    };
+
+    static const auto convert_ip = [](url& uri) {
+        in_addr a{};
+        if (inet_pton(AF_INET, std::get<std::string>(uri.host).data(), &a) == 1) uri.host = a;
+        else ERR("Invalid IPv4 address");
     };
 
     for (; i < input.size(); i++) {
@@ -205,12 +225,101 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
             case st_uri_host: {
                 switch (data[i]) {
                     case '[':
-                        /// Use inet_pton.
+                        state = st_i6;
                         break;
                     default:
-                        /// Use inet_pton. If it fails, then it’s a domain name.
+                        if (is_digit(data[i])) {
+                            start = i;
+                            fst = 0;
+                            state = st_i4;
+                            break;
+                        }
                         if (is_unreserved(data[i]) or is_sub_delim(data[i]) or data[i] == ':') break;
+                        state = st_uri_hostname;
                         ERR("Invalid URI authority");
+                }
+            } break;
+
+            case st_i6: {
+                ERR("IPv6 addresses are not supported");
+            }
+
+            case st_i4:
+            case st_i4_2: {
+                if (is_digit(data[i])) {
+                    state++;
+                    break;
+                }
+
+                switch (data[i]) {
+                    case '.':
+                        state = st_i4_delim;
+                        fst++;
+                        break;
+                    case ':':
+                        if (fst == 3) convert_ip(uri);
+                        state = st_uri_port;
+                        break;
+                    default:
+                        if (not is_unreserved(data[i]) and not is_sub_delim(data[i])) ERR("Invalid URI hostname");
+                        state = st_uri_hostname;
+                        break;
+                }
+            } break;
+
+            case st_i4_3: {
+                switch (data[i]) {
+                    case '.':
+                        state = st_i4_delim;
+                        fst++;
+                        break;
+                    case ':':
+                        if (fst == 3) convert_ip(uri);
+                        state = st_uri_port;
+                        break;
+                    default:
+                        if (not is_unreserved(data[i]) and not is_sub_delim(data[i])) ERR("Invalid URI hostname");
+                        state = st_uri_hostname;
+                        break;
+                }
+            } break;
+
+            case st_i4_delim: {
+                /// A 4th dot indicates that this is a hostname.
+                if (fst == 4) goto check_host;
+                if (is_digit(data[i])) {
+                    state = st_i4;
+                    break;
+                }
+
+                switch (data[i]) {
+                    case ':':
+                        if (fst == 3) convert_ip(uri);
+                        state = st_uri_port;
+                        break;
+                    case '/':
+                        uri.host = std::string(data + start, i - start);
+                        state = st_uri_path;
+                        break;
+                    default:
+                    check_host:
+                        if (not is_unreserved(data[i]) and not is_sub_delim(data[i])) ERR("Invalid URI hostname");
+                        state = st_uri_hostname;
+                        break;
+                }
+            } break;
+
+            case st_uri_port: {
+                switch (data[i]) {
+                    case '/':
+                        start = i;
+                        state = st_uri_path;
+                        break;
+                    default:
+                        if (not is_digit(data[i])) ERR("Invalid URI port");
+                        uri.port = uri.port * 10 + (data[i] - '0');
+                        if (++fst > 5 or uri.port > UINT16_MAX) ERR("Invalid URI port");
+                        break;
                 }
             } break;
 
@@ -383,6 +492,8 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
         /// Append remaining data.
         switch (state) {
             case st_uri_scheme: uri.scheme.append(data + start, u64(i - start)); break;
+            case st_uri_hostname: std::get<std::string>(uri.host).append(data + start, u64(i - start)); break;
+            case st_uri_userinfo_or_path:
             case st_uri_path: uri.path.append(data + start, u64(i - start)); break;
             case st_uri_param_name: parse_buffer1.append(data + start, u64(i - start)); break;
             case st_uri_param_val: parse_buffer2.append(data + start, u64(i - start)); break;
@@ -543,7 +654,7 @@ u32 net::http::detail::parse_headers(std::span<const char>& input, parser_state<
         }
     }
 
-    /// Return the currrent state.
+    /// Return the current state.
     L (ret) {
         /// Append remaining data.
         switch (state) {
