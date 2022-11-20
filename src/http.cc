@@ -371,6 +371,11 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                     break;
                 }
 
+                if (data[i] == '%') {
+                    state = st_uri_authority_percent;
+                    break;
+                }
+
                 /// Any other gen-delim indicates that there is no userinfo,
                 /// and we’ve actually been parsing the host + port.
                 if (is_gen_delim(data[i])) {
@@ -409,7 +414,6 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                             break;
                         case '?': state = st_uri_param_name_init; break;
                         case '#': state = st_uri_fragment_init; break;
-                        case '%': state = st_uri_authority_percent; break;
                         default: UNREACHABLE();
                     }
                     break;
