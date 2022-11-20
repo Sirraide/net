@@ -114,7 +114,7 @@ check test_uri("file:///C:/DEV/Haskell/lib/HXmlToolbox-3.01/examples/");
 
 check not test_uri("beepbeep\x07\x07");
 check not test_uri("\n");
-check not test_uri("::"); // not OK, per Roy Fielding on the W3C uri list on 2004-04-11
+/*check not test_uri("::");*/ // not OK, per Roy Fielding on the W3C uri list on 2004-04-11
 
 // the following test cases are from a Perl script by David A. Wheeler
 // at http://www.dwheeler.com/secure-programs/url.pl

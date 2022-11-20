@@ -251,7 +251,7 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         case '?': state = st_uri_param_name_init; break;
                         case '#': state = st_uri_fragment_init; break;
                         case '%': state = st_uri_path_percent; break;
-                        case ':': ERR("Invalid URI");
+                        case ':': state = st_uri_hier_part; break;
                         default:
                             if (not is_pchar(data[i])) ERR("Invalid character in URI path: '{}'", data[i]);
                             state = st_uri_path;
@@ -446,8 +446,10 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                             state = st_i4;
                             break;
                         }
-                        if (is_unreserved(data[i]) or is_sub_delim(data[i]) or data[i] == ':') break;
-                        state = st_uri_hostname;
+                        if (is_unreserved(data[i]) or is_sub_delim(data[i]) or data[i] == ':') {
+                            state = st_uri_hostname;
+                            break;
+                        }
                         ERR("Invalid URI authority");
                 }
             } break;
