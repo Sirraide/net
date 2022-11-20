@@ -53,6 +53,8 @@ public:
     nocopy(client);
     nomove(client);
 
+    static constexpr u16 default_port = 443;
+
     /// Returns the current host name or the empty string if not connected.
     [[nodiscard]] std::string_view host() const { return host_name; }
 

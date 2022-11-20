@@ -43,6 +43,8 @@ public:
     nocopy(tcp_base);
     nomove(tcp_base);
 
+    static constexpr u16 default_port = 80;
+
     /// Close the socket.
     void close() {
         if (fd != -1) {

@@ -117,24 +117,19 @@ public:
     /// sure to start this in a separate thread if you want to continue doing other
     /// things.
     ///
-    /// \param host The host to connect to.
     /// \param uri The websocket to connect to. The url must start with `ws://` or `wss://`.
     /// \throw std::runtime_error If the connection fails.
-    void connect(bool secure, std::string_view host, std::string_view path, u16 port = 0) {
+    void connect(url uri) {
         /// Make sure our backend is an SSL client if this is a wss:// url.
         if constexpr (is<backend_t, net::ssl::client>) {
-            if (not secure) {
-                throw std::runtime_error("Cannot connect to a ws:// url with an SSL backend");
-            }
+            if (uri.scheme != "wss") throw std::runtime_error("Cannot connect to a non wss:// url with an SSL backend");
         } else {
-            if (secure) {
-                throw std::runtime_error("Cannot connect to a wss:// url with a non-SSL backend");
-            }
+            if (uri.scheme != "ws") throw std::runtime_error("Cannot connect to a non ws:// url with a non-SSL backend");
         }
 
         /// Connect to the server.
-        if (not port) port = secure ? 443 : 80;
-        conn.connect(host, port);
+        if (not uri.port) uri.port = backend_t::default_port;
+        conn.connect(uri.host, uri.port);
 
         /// Random key.
         octets unencoded_key;
@@ -154,7 +149,7 @@ public:
         /// Send the HTTP upgrade request.
         request req;
         req.meth = method::get;
-        req.uri.path = path;
+        req.uri.path = uri.path;
         req.hdrs["Upgrade"] = "websocket";
         req.hdrs["Connection"] = "Upgrade";
         req.hdrs["Sec-WebSocket-Key"] = std::string_view{reinterpret_cast<char*>(encoded_key.data()), encoded_key.size()};

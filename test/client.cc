@@ -32,7 +32,7 @@ void websocket() {
         fmt::print("Received: {}\n", m.buffer.str());
     };
     client.on_ready = [&] { client.send_frame(ws::opcode::text, "Hello, world!"); };
-    client.connect(true, "echo.websocket.events", "/");
+    client.connect(http::url{"wss://echo.websockets.events/"});
 }
 
 int main() {
