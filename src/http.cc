@@ -1,4 +1,7 @@
 #include <net/http.hh>
+#include <ranges>
+
+namespace ranges = std::ranges;
 
 /// Define a label.
 #define L(name) \
@@ -133,11 +136,6 @@ constexpr inline bool istext(unsigned char c) {
     return charmap_text[c];
 }
 
-/// See RFC 7230.
-constexpr inline bool isurichar(char c) {
-    return uint8_t(c) < 128 and charmap_uri[uint8_t(c)];
-}
-
 constexpr inline i8 xtonum(char c) {
     if (c >= '0' and c <= '9') return static_cast<i8>(c - '0');
     else if (c >= 'A' and c <= 'F') return static_cast<i8>(c - 'A') + 10;
@@ -150,8 +148,7 @@ constexpr bool is_gen_delim(char c) {
 }
 
 constexpr bool is_sub_delim(char c) {
-    return c == ':' or c == '/' or c == '?' or c == '#' or c == '[' or c == ']' or c == '@'
-           or c == '!' or c == '$' or c == '&' or c == '\'' or c == '(' or c == ')'
+    return c == '!' or c == '$' or c == '&' or c == '\'' or c == '(' or c == ')'
            or c == '*' or c == '+' or c == ',' or c == ';' or c == '=';
 }
 
@@ -201,6 +198,8 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
         st_i4_3,
         st_i4_delim,
 
+        st_uri_host_percent,
+        st_uri_host_percent_2,
         st_uri_path_percent,
         st_uri_path_percent_2,
         st_uri_param_name_percent,
@@ -252,8 +251,9 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         case '?': state = st_uri_param_name_init; break;
                         case '#': state = st_uri_fragment_init; break;
                         case '%': state = st_uri_path_percent; break;
+                        case ':': ERR("Invalid URI");
                         default:
-                            if (not isurichar(data[i])) ERR("Invalid character in URI path: '{}'", data[i]);
+                            if (not is_pchar(data[i])) ERR("Invalid character in URI path: '{}'", data[i]);
                             state = st_uri_path;
                             break;
                     }
@@ -297,7 +297,7 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                                 state = st_uri_path_percent;
                                 break;
                             default:
-                                if (not isurichar(data[i])) ERR("Invalid character in URI path: '{}'", data[i]);
+                                if (not is_pchar(data[i])) ERR("Invalid character in URI path: '{}'", data[i]);
                                 state = st_uri_path;
                                 break;
                         }
@@ -306,8 +306,7 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
 
             /// Handles <authority> <path-abempty>, <path-absolute>, and <path-rootless>.
             /// <path-empty> is handled by returning from the function.
-            case st_uri_hier_part:
-            case st_uri_hier_part_slash_allow_empty: {
+            case st_uri_hier_part: {
                 switch (data[i]) {
                     /// <authority> <path-abempty> | <path-absolute>
                     case '/':
@@ -321,14 +320,15 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         break;
                     /// <path-rootless>
                     default:
-                        if (not isurichar(data[i])) ERR("Invalid character in URI path: '{}'", data[i]);
+                        if (not is_pchar(data[i])) ERR("Invalid character in URI path: '{}'", data[i]);
                         start = i;
                         state = st_uri_path;
                         break;
                 }
             } break;
 
-            case st_uri_hier_part_slash: {
+            case st_uri_hier_part_slash:
+            case st_uri_hier_part_slash_allow_empty: {
                 switch (data[i]) {
                     /// <authority> <path-abempty>
                     case '/':
@@ -343,7 +343,7 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         break;
                     /// <path-absolute>
                     default:
-                        if (not isurichar(data[i])) ERR("Invalid character in URI path: '{}'", data[i]);
+                        if (not is_pchar(data[i])) ERR("Invalid character in URI path: '{}'", data[i]);
                         start = i;
                         state = st_uri_path;
                         break;
@@ -356,39 +356,66 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
             }
 
             case st_uri_authority: {
-                switch (data[i]) {
-                    case '@':
-                        /// If we get here, then we’ve actually been parsing the userinfo,
-                        /// and not the host, so we need to move it into the right place and
-                        /// parse the host.
-                        std::exchange(uri.userinfo, uri.host);
-                        uri.userinfo.append(data + start, i - start);
-                        state = st_uri_host;
-                        break;
-                    case '/':
-                        uri.host.append(data + start, i - start);
-                        start = i;
-                        state = st_uri_path;
-                        break;
-                    case '?':
-                        uri.host.append(data + start, i - start);
-                        state = st_uri_param_name_init;
-                        break;
-                    case '#':
-                        uri.host.append(data + start, i - start);
-                        state = st_uri_fragment_init;
-                        break;
-                    case '%':
-                        uri.host.append(data + start, i - start);
-                        state = st_uri_authority_percent;
-                        break;
-                    default:
-                        if (is_unreserved(data[i]) or is_sub_delim(data[i]) or data[i] == ':') {
-                            state = st_uri_authority;
-                            break;
-                        }
-                        ERR("Invalid URI authority");
+                /// If we get here, then we’ve actually been parsing the userinfo,
+                /// and not the host, so we need to move it into the right place and
+                /// parse the host.
+                if (data[i] == '@') {
+                    std::exchange(uri.userinfo, uri.host);
+                    uri.userinfo.append(data + start, i - start);
+                    state = st_uri_host;
+                    break;
                 }
+
+                if (is_unreserved(data[i]) or is_sub_delim(data[i]) or data[i] == ':') {
+                    state = st_uri_authority;
+                    break;
+                }
+
+                /// Any other gen-delim indicates that there is no userinfo,
+                /// and we’ve actually been parsing the host + port.
+                if (is_gen_delim(data[i])) {
+                    if (data[i] == ']') ERR("Invalid URI host");
+                    if (data[i] == '[') ERR("Sorry, IPv6 addresses are not supported");
+                    uri.host.append(data + start, i - start);
+
+                    /// Split the host into host and port if applicable and make
+                    /// sure that both are valid.
+                    if (auto colon = uri.host.find(':'); colon != std::string::npos) {
+                        /// Two colons are invalid.
+                        if (uri.host.find(':', colon + 1) != std::string::npos) ERR("Invalid URI host");
+
+                        /// Make sure the port is valid.
+                        auto port_str = uri.host.substr(colon + 1);
+                        if (not ranges::all_of(port_str, is_digit)) ERR("Invalid URI port");
+
+                        char *end;
+                        auto port = std::strtoll(port_str.c_str(), &end, 10);
+                        if (port > UINT16_MAX or end != port_str.c_str() + port_str.size()) ERR("Invalid URI port");
+                        uri.port = u16(port);
+
+                        /// If the host resembles an IPv4 address, make sure it is valid.
+                        auto host_str = uri.host.substr(0, colon);
+                        if (ranges::all_of(host_str, [](char c){ return is_digit(c) or c == '.'; }) and ranges::count(host_str, '.') == 3) {
+                            in_addr addr{};
+                            if (inet_pton(AF_INET, host_str.c_str(), &addr) != 1) ERR("Invalid URI host");
+                        }
+                        uri.host = std::move(host_str);
+                    }
+
+                    switch (data[i]) {
+                        case '/':
+                            start = i;
+                            state = st_uri_path;
+                            break;
+                        case '?': state = st_uri_param_name_init; break;
+                        case '#': state = st_uri_fragment_init; break;
+                        case '%': state = st_uri_authority_percent; break;
+                        default: UNREACHABLE();
+                    }
+                    break;
+                }
+
+                ERR("Invalid URI authority");
             } break;
 
             case st_uri_authority_percent: {
@@ -404,6 +431,10 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                     case '[':
                         state = st_i6;
                         break;
+                    case '%':
+                        uri.host.append(data + start, i - start);
+                        state = st_uri_host_percent;
+                        break;
                     default:
                         start = i;
                         if (is_digit(data[i])) {
@@ -415,6 +446,14 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         state = st_uri_hostname;
                         ERR("Invalid URI authority");
                 }
+            } break;
+
+            case st_uri_host_percent: {
+                PERC_FST(st_uri_host_percent_2);
+            } break;
+
+            case st_uri_host_percent_2: {
+                PERC_SND(st_uri_host, uri.host);
             } break;
 
             case st_uri_hostname: {
@@ -591,7 +630,7 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         state = st_uri_fragment_init;
                         break;
                     default:
-                        if (not isurichar(data[i])) ERR("Invalid character in URI: '{}'", data[i]);
+                        if (not is_pchar(data[i])) ERR("Invalid character in URI: '{}'", data[i]);
                         [[fallthrough]];
                     case '/':
                         state = st_uri_path;
@@ -640,7 +679,7 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         state = st_uri_fragment_init;
                         break;
                     default:
-                        if (not isurichar(data[i])) ERR("Invalid character in URI param name: {}", data[i]);
+                        if (not is_pchar(data[i])) ERR("Invalid character in URI param name: {}", data[i]);
                         state = st_uri_param_name;
                         break;
                 }
@@ -684,7 +723,7 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         state = st_uri_fragment_init;
                         break;
                     default:
-                        if (not isurichar(data[i])) ERR("Invalid character in URI param value: {}", data[i]);
+                        if (not is_pchar(data[i])) ERR("Invalid character in URI param value: {}", data[i]);
                         state = st_uri_param_val;
                         break;
                 }
@@ -721,7 +760,7 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         state = st_uri_fragment;
                         break;
                     default:
-                        if (not isurichar(data[i])) ERR("Invalid character in URI fragment: {}", data[i]);
+                        if (not is_pchar(data[i])) ERR("Invalid character in URI fragment: {}", data[i]);
                         state = st_uri_fragment;
                         break;
                 }
