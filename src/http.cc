@@ -393,14 +393,14 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
                         auto port_str = uri.host.substr(colon + 1);
                         if (not ranges::all_of(port_str, is_digit)) ERR("Invalid URI port");
 
-                        char *end;
+                        char* end;
                         auto port = std::strtoll(port_str.c_str(), &end, 10);
                         if (port > UINT16_MAX or end != port_str.c_str() + port_str.size()) ERR("Invalid URI port");
                         uri.port = u16(port);
 
                         /// If the host resembles an IPv4 address, make sure it is valid.
                         auto host_str = uri.host.substr(0, colon);
-                        if (ranges::all_of(host_str, [](char c){ return is_digit(c) or c == '.'; }) and ranges::count(host_str, '.') == 3) {
+                        if (ranges::all_of(host_str, [](char c) { return is_digit(c) or c == '.'; }) and ranges::count(host_str, '.') == 3) {
                             in_addr addr{};
                             if (inet_pton(AF_INET, host_str.c_str(), &addr) != 1) ERR("Invalid URI host");
                         }
@@ -789,7 +789,7 @@ u32 net::http::detail::parse_uri(std::span<const char>& input, parser_state<url>
             case st_uri_scheme: uri.scheme.append(data + start, u64(i - start)); break;
             case st_uri_authority:
             case st_uri_hostname: uri.host.append(data + start, u64(i - start)); break;
-            case st_uri_scheme_allow_empty: /// (!)
+            case st_uri_scheme_allow_empty:          /// (!)
             case st_uri_hier_part_slash_allow_empty: /// (!)
             case st_uri_path: uri.path.append(data + start, u64(i - start)); break;
             case st_uri_param_name: parse_buffer1.append(data + start, u64(i - start)); break;
@@ -995,45 +995,48 @@ u32 net::http::detail::parse_body(std::span<const char>& input, parser_state<oct
     /// Actual body parser.
     u64 i = 0;
     const char* data = input.data();
+
+    /// We handle this state even if there are no characters in the
+    /// input because it determines whether we even have a body.
+    if (state == st_start) {
+        /// All 1xx (informational), 204 (no content), and 304 (not modified)
+        /// responses MUST NOT include a message-body.
+        if (msg.proto == 9) return st_done_state;
+        if (parser.is_response) {
+            auto& res = static_cast<response&>(msg);
+            if (res.status < 200 or res.status == 204 or res.status == 304) return st_done_state;
+        }
+
+        /// If a Transfer-Encoding header field (section 14.41) is present and
+        /// has any value other than "identity", then the transfer-length is
+        /// defined by use of the "chunked" transfer-coding (section 3.6),
+        /// unless the message is terminated by closing the connection.
+        auto t = msg.hdrs["Transfer-Encoding"];
+        if (t and *t != "identity") {
+            state = st_chunk_size;
+        }
+
+        /// If a Content-Length header field (section 14.13) is present, its
+        /// decimal value in OCTETs represents both the entity-length and the
+        /// transfer-length.
+        ///
+        /// If a message is received with both a Transfer-Encoding header field
+        /// and a Content-Length header field, the latter MUST be ignored.
+        else if (auto l = msg.hdrs["Content-Length"]; l and (not t or *t == "identity")) {
+            parser.len = std::stoull(*l);
+            state = st_read_body;
+        }
+
+        /// Otherwise, the end of the message body is indicated by the closing
+        /// of the connection.
+        else { state = st_read_until_conn_close; }
+    }
+
+    /// Actual body parser.
     for (; i < input.size(); i++) {
         switch (static_cast<state_t>(state)) {
-            case st_start: {
-                /// All 1xx (informational), 204 (no content), and 304 (not modified)
-                /// responses MUST NOT include a message-body.
-                if (msg.proto == 9) return st_done_state;
-                if (parser.is_response) {
-                    auto& res = static_cast<response&>(msg);
-                    if (res.status == 204 or res.status == 304) return st_done_state;
-                }
-
-                /// If a Transfer-Encoding header field (section 14.41) is present and
-                /// has any value other than "identity", then the transfer-length is
-                /// defined by use of the "chunked" transfer-coding (section 3.6),
-                /// unless the message is terminated by closing the connection.
-                auto t = msg.hdrs["Transfer-Encoding"];
-                if (t and *t != "identity") {
-                    state = st_chunk_size;
-                    goto chunked; /// Jump to chunked parser.
-                }
-
-                /// If a Content-Length header field (section 14.13) is present, its
-                /// decimal value in OCTETs represents both the entity-length and the
-                /// transfer-length.
-                ///
-                /// If a message is received with both a Transfer-Encoding header field
-                /// and a Content-Length header field, the latter MUST be ignored.
-                if (auto l = msg.hdrs["Content-Length"]; l and (not t or *t == "identity")) {
-                    parser.len = std::stoull(*l);
-                    goto read_body;
-                }
-
-                /// Otherwise, the end of the message body is indicated by the closing
-                /// of the connection.
-                goto read_until_conn_close;
-            }
-
+            case st_start: UNREACHABLE();
             /// Read up to a certain number of bytes from the input.
-            read_body:
             case st_read_body: {
                 auto chunk = std::min<u64>(parser.len, input.size());
                 msg.body.reserve(msg.body.size() + chunk);
@@ -1053,7 +1056,6 @@ u32 net::http::detail::parse_body(std::span<const char>& input, parser_state<oct
             }
 
             /// Read the entire input until the connection is closed.
-            read_until_conn_close:
             case st_read_until_conn_close: {
                 msg.body.reserve(msg.body.size() + input.size());
                 msg.body.insert(
@@ -1068,7 +1070,6 @@ u32 net::http::detail::parse_body(std::span<const char>& input, parser_state<oct
             }
 
             /// Chunk size.
-            chunked:
             case st_chunk_size: {
                 switch (data[i]) {
                     case '0' ... '9':
@@ -1391,15 +1392,7 @@ u32 net::http::detail::parse_request(std::span<const char>& input, parser_state<
                 state = parse_headers(input, hdrs_parser, req.hdrs, state);
 
                 /// Headers parser is done.
-                if (state == st_done_state) {
-                    if (input.empty()) return st_body;
-
-                    /// Update our state.
-                    state = st_body;
-                    data = input.data();
-                    i = 0;
-                    break;
-                }
+                if (state == st_done_state) return parse_body(input, parser.body_parser, req, st_body);
 
                 /// Headers parser needs more data.
                 return state;
@@ -1538,15 +1531,7 @@ u32 net::http::detail::parse_response(std::span<const char>& input, parser_state
                 state = parse_headers(input, hdrs_parser, res.hdrs, state);
 
                 /// Headers parser is done.
-                if (state == st_done_state) {
-                    if (input.empty()) return st_body;
-
-                    /// Update our state.
-                    state = st_body;
-                    data = input.data();
-                    i = 0;
-                    break;
-                }
+                if (state == st_done_state) return parse_body(input, parser.body_parser, res, st_body);
 
                 /// Headers parser needs more data.
                 return state;
@@ -1654,7 +1639,7 @@ auto net::http::perform(url&& uri, method meth, usz max_redirects) -> response {
         else throw std::runtime_error("Unsupported scheme: " + uri.scheme);
 
         /// Check if we need to follow a redirect.
-        if (res.status== 301 or res.status == 302 or res.status == 303 or res.status == 307 or res.status == 308) {
+        if (res.status == 301 or res.status == 302 or res.status == 303 or res.status == 307 or res.status == 308) {
             auto loc = res.hdrs["Location"];
             if (not loc) throw std::runtime_error("Redirect response missing Location header");
 
