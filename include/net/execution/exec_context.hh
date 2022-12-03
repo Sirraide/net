@@ -8,9 +8,7 @@
 #include <queue>
 #include <thread>
 
-namespace net {
-
-namespace detail {
+namespace net::detail {
 
 #define L(x) \
 x:
@@ -56,6 +54,9 @@ class synchronised {
     std::mutex mutex;
 
 public:
+    template <typename... arguments>
+    synchronised(arguments&&... args) : value{std::forward<arguments>(args)...} {}
+
     template <typename func>
     auto with_lock(func&& f) {
         std::unique_lock lock{mutex};
@@ -88,7 +89,8 @@ public:
     }
 };
 
-} // namespace detail
+template <typename>
+constexpr inline bool always_false = false;
 
 /// Flag used to stop the execution context.
 class stop_flag {
@@ -132,7 +134,7 @@ class execution_context final {
         std::atomic<usz>& mask;
 
         /// Used to tell us that we should resume execution.
-        detail::atomic_cond_var resume;
+        atomic_cond_var resume;
 
         /// The function to execute.
         task_t task;
@@ -141,6 +143,10 @@ class execution_context final {
         explicit thread_context(execution_context& ctx, usz id, std::atomic<usz>& _mask)
             : context(ctx), relative_thread_id(id), mask(_mask) {
             thread = std::jthread([this](std::stop_token stop) {
+                /// We probably don’t want to abort a worker thread if there is an error.
+                std::exception_ptr error;
+
+                /// Execute tasks until we’re told to stop.
                 while (not stop.stop_requested()) {
                     /// Wait until the context tells us that there’s a task.
                     resume.wait();
@@ -151,9 +157,12 @@ class execution_context final {
                     /// Run the task.
                     try {
                         std::invoke(task, context);
-                    } catch (const std::exception& e) {
-                        /// TODO: What to do here?
-                        err("Exception in worker thread: %s", e.what());
+                    } catch (...) { error = std::current_exception(); }
+
+                    /// Report an error if there was one.
+                    if (error) {
+                        context.exception_in_worker_thread(std::move(error), std::move(task));
+                        error = {};
                     }
 
                     /// Tell the context that we’re free and that it
@@ -173,13 +182,13 @@ class execution_context final {
     };
 
     /// Thread masks. These are used to determine what threads are idle.
-    detail::uninitialised_fixed_vector<std::atomic<usz>> masks;
+    uninitialised_fixed_vector<std::atomic<usz>> masks;
 
     /// Threads.
-    detail::uninitialised_fixed_vector<thread_context> threads;
+    uninitialised_fixed_vector<thread_context> threads;
 
     /// Queue of tasks to run if all threads are busy.
-    detail::synchronised<std::queue<task_t>> task_queue;
+    synchronised<std::queue<task_t>> task_queue;
 
     /// Condition variable for the task queue.
     std::condition_variable task_queue_cv;
@@ -187,13 +196,17 @@ class execution_context final {
     /// Stop token for the main thread.
     std::stop_token main_stop_token{};
 
+    /// Exception handler.
+    synchronised<std::function<void(execution_context&, std::exception_ptr&&, task_t&&)>> exception_handler =
+        [](auto&, auto&& e, auto) { std::rethrow_exception(e); };
+
     /// Enqueue a task. Return false if the task was enqueued, true if it was
     /// executed immediately.
     ///
     /// This function is not exposed because the return value might
     /// be confusing and is not useful to the user.
     template <typename func, bool should_enqueue>
-    [[nodiscard]] bool add_task_impl(func&& f) {
+    [[nodiscard]] bool add_task_impl(func&& f) noexcept(!should_enqueue) {
         /// Create the task.
         task_t task;
         if constexpr (std::is_invocable_v<func, execution_context&>) task = std::forward<func>(f);
@@ -243,12 +256,19 @@ class execution_context final {
     }
 
     template <typename func>
-    [[nodiscard]] bool add_task_unlocked(func&& f) {
+    [[nodiscard]] bool add_task_unlocked(func&& f) noexcept {
         return add_task_impl<func, false>(std::forward<func>(f));
     }
 
+    /// Act on an exception that was thrown in a task.
+    void exception_in_worker_thread(std::exception_ptr&& e, task_t&& task) {
+        exception_handler.with_lock([&](auto& handler) {
+            std::invoke(handler, *this, std::move(e), std::move(task));
+        });
+    }
+
     /// Stop execution.
-    void stop() {
+    void stop() noexcept {
         /// Wake up all threads.
         for (auto& thread : threads) {
             thread.thread.request_stop();
@@ -276,10 +296,11 @@ public:
     }
 
     /// Tear down the execution context.
-    ~execution_context() { stop(); }
+    ~execution_context() noexcept { stop(); }
 
     /// Add a task to the execution context.
     template <typename func>
+    requires std::is_invocable_v<func> or std::is_invocable_v<func, execution_context&>
     void add_task(func&& f) {
         (void) add_task_locked(std::forward<func>(f));
     }
@@ -311,7 +332,7 @@ public:
             task_queue.with_lock([&](auto& queue, auto&& lock) {
                 while (queue.empty() and not stop.stopped()) {
                     task_queue_cv.wait(lock, [&] {
-                        return not queue.empty() || stop.stopped();
+                        return not queue.empty() or stop.stopped();
                     });
                 }
 
@@ -330,10 +351,42 @@ public:
             });
         }
     }
+
+    /// Set exception handler for this execution context.
+    template <typename handler_type>
+    void set_exception_handler(handler_type&& handler) {
+        if constexpr (std::is_invocable_v<handler_type, execution_context&, std::exception_ptr&&, task_t&&>)
+            exception_handler = std::forward<handler_type>(handler);
+        else if constexpr (std::is_invocable_v<handler_type, std::exception_ptr&&, task_t&&>)
+            exception_handler = [handler = std::forward<handler_type>(handler)](auto&, std::exception_ptr&& e, task_t&& task) {
+                handler(std::move(e), std::move(task));
+            };
+        else if constexpr (std::is_invocable_v<handler_type, execution_context&, std::exception_ptr&&>)
+            exception_handler = [handler = std::forward<handler_type>(handler)](auto& ctx, std::exception_ptr&& e, auto&&) {
+                handler(ctx, std::move(e));
+            };
+        else if constexpr (std::is_invocable_v<handler_type, std::exception_ptr&&>)
+            exception_handler = [handler = std::forward<handler_type>(handler)](auto&, std::exception_ptr&& e, auto&&) {
+                handler(std::move(e));
+            };
+        else if constexpr (std::is_invocable_v<handler_type>)
+            exception_handler = [handler = std::forward<handler_type>(handler)](auto&, auto&&, auto&&) {
+                handler();
+            };
+        else static_assert(always_false<handler_type>, "Invalid exception handler type");
+    }
 };
 
 #undef L
 
+} // namespace net::detail
+
+/// ===========================================================================
+///  API
+/// ===========================================================================
+namespace net {
+using detail::execution_context;
+using detail::stop_flag;
 } // namespace net
 
 #endif // NET_EXEC_CONTEXT_HH
