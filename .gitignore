@@ -9,3 +9,4 @@ curl
 tests
 
 callgrind.out.*
+cmake-build-*

@@ -74,7 +74,8 @@ add_dependencies(options openssl)
 
 target_link_libraries(net PUBLIC
 	fmt
-	libcurl
+	#libcurl
+	benchmark
 	zlib
 	${PROJECT_SOURCE_DIR}/libs/libcrypto.so
 	${PROJECT_SOURCE_DIR}/libs/libssl.so

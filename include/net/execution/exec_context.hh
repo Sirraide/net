@@ -88,7 +88,21 @@ public:
     }
 };
 
-}
+} // namespace detail
+
+/// Flag used to stop the execution context.
+class stop_flag {
+    std::atomic_flag flag = ATOMIC_FLAG_INIT;
+
+public:
+    stop_flag() = default;
+    ~stop_flag() = default;
+    nomove(stop_flag);
+    nocopy(stop_flag);
+
+    void stop() noexcept { flag.test_and_set(); }
+    [[nodiscard]] bool stopped() const noexcept { return flag.test(); }
+};
 
 /// Context for threads and jobs.
 ///
@@ -136,7 +150,7 @@ class execution_context final {
 
                     /// Run the task.
                     try {
-                        task(context);
+                        std::invoke(task, context);
                     } catch (const std::exception& e) {
                         /// TODO: What to do here?
                         err("Exception in worker thread: %s", e.what());
@@ -144,7 +158,7 @@ class execution_context final {
 
                     /// Tell the context that we’re free and that it
                     /// can enqueue the next task if there is one.
-                    mask.fetch_or(1 << relative_thread_id);
+                    mask.fetch_xor(1 << relative_thread_id);
                     context.task_queue_cv.notify_one();
                 }
             });
@@ -167,18 +181,18 @@ class execution_context final {
     /// Queue of tasks to run if all threads are busy.
     detail::synchronised<std::queue<task_t>> task_queue;
 
-    /// Thread that checks the task queue.
-    std::jthread task_queue_thread;
-
     /// Condition variable for the task queue.
     std::condition_variable task_queue_cv;
+
+    /// Stop token for the main thread.
+    std::stop_token main_stop_token{};
 
     /// Enqueue a task. Return false if the task was enqueued, true if it was
     /// executed immediately.
     ///
     /// This function is not exposed because the return value might
     /// be confusing and is not useful to the user.
-    template <typename func>
+    template <typename func, bool should_enqueue>
     [[nodiscard]] bool add_task_impl(func&& f) {
         /// Create the task.
         task_t task;
@@ -196,7 +210,7 @@ class execution_context final {
                 if (mask == compl usz(0)) goto next_mask;
 
                 /// Find the first free thread.
-                thread_id = __builtin_ctz(~mask);
+                thread_id = __builtin_ctzll(~mask);
             } while (not masks[i].compare_exchange_weak(mask, mask | (1 << thread_id)));
 
             /// Set the task and tell the thread to resume.
@@ -211,9 +225,37 @@ class execution_context final {
         }
 
         /// If we get here, all threads are busy. Enqueue the task.
-        task_queue.with_lock([&](auto& queue) { queue.push(std::move(task)); });
-        if (std::this_thread::get_id() != task_queue_thread.get_id()) task_queue_cv.notify_one();
+        /// The queue thread already holds a lock on the queue and
+        /// will enqueue the task itself, so there is no point in
+        /// doing it here.
+        if constexpr (should_enqueue) {
+            task_queue.with_lock([&](auto& queue) { queue.push(std::move(task)); });
+            task_queue_cv.notify_one();
+        }
+
+        /// We failed to execute the task immediately.
         return false;
+    }
+
+    template <typename func>
+    [[nodiscard]] bool add_task_locked(func&& f) {
+        return add_task_impl<func, true>(std::forward<func>(f));
+    }
+
+    template <typename func>
+    [[nodiscard]] bool add_task_unlocked(func&& f) {
+        return add_task_impl<func, false>(std::forward<func>(f));
+    }
+
+    /// Stop execution.
+    void stop() {
+        /// Wake up all threads.
+        for (auto& thread : threads) {
+            thread.thread.request_stop();
+            thread.resume.notify();
+        }
+
+        task_queue_cv.notify_all();
     }
 
 public:
@@ -231,51 +273,62 @@ public:
                 masks[i / (sizeof(usz) * CHAR_BIT)]
             );
         }
-
-        /// Start the task queue thread.
-        task_queue_thread = std::jthread([this](std::stop_token stop) {
-            while (not stop.stop_requested()) {
-                /// Wait for a task.
-                task_queue.with_lock([&](auto& queue, auto& lock) {
-                    while (queue.empty() and not stop.stop_requested()) {
-                        task_queue_cv.wait(lock, [&] {
-                            return not queue.empty() || stop.stop_requested();
-                        });
-                    }
-
-                    /// If we’re stopping, stop.
-                    if (stop.stop_requested()) return;
-
-                    /// Try to run as many tasks as possible.
-                    while (not queue.empty()) {
-                        auto task = std::move(queue.front());
-                        queue.pop();
-                        if (not add_task_impl(task)) {
-                            queue.push(std::move(task));
-                            break;
-                        }
-                    }
-                });
-            }
-        });
     }
 
     /// Tear down the execution context.
-    ~execution_context() {
-        /// Wake up all threads.
-        for (auto& thread : threads) {
-            thread.thread.request_stop();
-            thread.resume.notify();
-        }
-
-        task_queue_thread.request_stop();
-        task_queue_cv.notify_all();
-    }
+    ~execution_context() { stop(); }
 
     /// Add a task to the execution context.
     template <typename func>
     void add_task(func&& f) {
-        (void) add_task_impl(std::forward<func>(f));
+        (void) add_task_locked(std::forward<func>(f));
+    }
+
+    /// Flush all tasks and stop.
+    void flush_and_stop() {
+        stop();
+
+        /// Run all remaining tasks.
+        task_queue.with_lock([&](auto& queue) {
+            while (not queue.empty()) {
+                std::invoke(queue.front(), *this);
+                queue.pop();
+            }
+        });
+    }
+
+    /// Flush all tasks and stop.
+    /// Stop the run_forever() thread too.
+    void flush_and_stop(stop_flag& flag) {
+        flag.stop();
+        flush_and_stop();
+    }
+
+    /// Run the main loop.
+    void run_forever(stop_flag& stop) {
+        while (not stop.stopped()) {
+            /// Wait for a task.
+            task_queue.with_lock([&](auto& queue, auto&& lock) {
+                while (queue.empty() and not stop.stopped()) {
+                    task_queue_cv.wait(lock, [&] {
+                        return not queue.empty() || stop.stopped();
+                    });
+                }
+
+                /// If we’re stopping, stop.
+                if (stop.stopped()) return;
+
+                /// Try to run as many tasks as possible.
+                while (not queue.empty()) {
+                    auto task = std::move(queue.front());
+                    queue.pop();
+                    if (not add_task_unlocked(task)) {
+                        queue.push(std::move(task));
+                        break;
+                    }
+                }
+            });
+        }
     }
 };
 
