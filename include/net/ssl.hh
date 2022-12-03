@@ -225,6 +225,7 @@ public:
             if (ret < 0) {
                 if (not BIO_should_retry(bio)) raise("OpenSSL: BIO_read() failed");
                 if (std::chrono::steady_clock::now() - now > timeout) throw timed_out();
+                if (not at_least) return u64(ret);
                 continue;
             }
             n_read += ret;
